@@ -50,6 +50,8 @@ import type {
 	ExtensionCommandContext,
 	ExtensionContext,
 	AgentEndEvent,
+	KeybindingsManager,
+	Theme,
 } from "@earendil-works/pi-coding-agent";
 import {
 	BorderedLoader,
@@ -70,7 +72,9 @@ import {
 	SelectList,
 	Text,
 	matchesKey,
+	type Component,
 	type SelectItem,
+	type TUI,
 } from "@earendil-works/pi-tui";
 
 // ==========================================================================
@@ -405,9 +409,14 @@ interface QuotaCheckResult {
 	score: number;
 }
 
+interface QuotaCheckContext {
+	modelRegistry: ExtensionContext["modelRegistry"];
+	modelId?: string;
+}
+
 interface ProviderQuotaChecker {
 	baseProvider: string;
-	check(account: QuotaAccount, signal?: AbortSignal): Promise<QuotaCheckResult>;
+	check(account: QuotaAccount, signal?: AbortSignal, context?: QuotaCheckContext): Promise<QuotaCheckResult>;
 }
 
 interface CodexUsageWindow {
@@ -757,7 +766,276 @@ function getWrappedSelectIndex(items: SelectItem[], value: string | undefined): 
 	return index >= 0 ? index : 0;
 }
 
-async function showWrappedSelect(
+// ==========================================================================
+// Menu session: keep one custom UI open across chained menus
+// ==========================================================================
+
+/**
+ * Every menu screen used to be its own `ctx.ui.custom()` call. The TUI host
+ * closes a non-overlay custom component by restoring the chat editor inside
+ * `done()` (interactive-mode `showExtensionCustom` -> `restoreEditor`), and
+ * `TUI.handleTerminalInput()` schedules the resulting frame on
+ * `process.nextTick` right after the component handled the key. Node drains
+ * that tick before the promise continuation that opens the next screen, so
+ * pressing Enter rendered one full chat-editor frame between menus.
+ *
+ * A menu session opens a single `ctx.ui.custom()` for a whole command flow and
+ * swaps the rendered child in place, so the editor is restored exactly once,
+ * when the flow ends.
+ */
+type MenuSessionChild = Component & { dispose?(): void };
+
+type MenuCustomFactory<T> = (
+	tui: TUI,
+	theme: Theme,
+	keybindings: KeybindingsManager,
+	done: (result: T) => void,
+) => MenuSessionChild | Promise<MenuSessionChild>;
+
+type ExtensionUI = ExtensionCommandContext["ui"];
+type CustomOptions = Parameters<ExtensionUI["custom"]>[1];
+type MouseEventArg = Parameters<NonNullable<Component["handleMouse"]>>[0];
+
+/** Host-facing component that renders whichever menu screen is currently active. */
+class MenuSessionComponent implements Component {
+	private child: MenuSessionChild | undefined;
+	private acceptsInput = false;
+
+	setChild(child: MenuSessionChild): void {
+		if (this.child && this.child !== child) this.releaseChild(this.child);
+		this.child = child;
+		this.acceptsInput = true;
+		if ("focused" in child) (child as MenuSessionChild & { focused: boolean }).focused = true;
+	}
+
+	/**
+	 * Stop routing input to a screen that already resolved, while keeping its
+	 * last frame on screen until the next screen mounts (no blank frame, no
+	 * input delivered to a dead screen).
+	 */
+	detachChild(): void {
+		this.acceptsInput = false;
+	}
+
+	render(width: number): string[] {
+		return this.child ? this.child.render(width) : [];
+	}
+
+	invalidate(): void {
+		this.child?.invalidate();
+	}
+
+	handleInput(data: string): void {
+		if (!this.acceptsInput) return;
+		this.child?.handleInput?.(data);
+	}
+
+	handleMouse(event: MouseEventArg): ReturnType<NonNullable<Component["handleMouse"]>> {
+		if (!this.acceptsInput) return undefined;
+		return this.child?.handleMouse?.(event);
+	}
+
+	dispose(): void {
+		if (this.child) this.releaseChild(this.child);
+		this.child = undefined;
+		this.acceptsInput = false;
+	}
+
+	private releaseChild(child: MenuSessionChild): void {
+		if ("focused" in child) (child as MenuSessionChild & { focused: boolean }).focused = false;
+		try {
+			child.dispose?.();
+		} catch {
+			/* ignore dispose errors, same as the host does */
+		}
+	}
+}
+
+/** One long-lived `ctx.ui.custom()` that hosts a sequence of menu screens. */
+class MenuSession {
+	private closed: Promise<void> | undefined;
+	private finished = false;
+	private readonly component: MenuSessionComponent;
+	private readonly tui: TUI;
+	private readonly theme: Theme;
+	private readonly keybindings: KeybindingsManager;
+	private readonly finish: () => void;
+
+	private constructor(
+		component: MenuSessionComponent,
+		tui: TUI,
+		theme: Theme,
+		keybindings: KeybindingsManager,
+		finish: () => void,
+	) {
+		this.component = component;
+		this.tui = tui;
+		this.theme = theme;
+		this.keybindings = keybindings;
+		this.finish = finish;
+	}
+
+	/**
+	 * Opens the session. Returns undefined when the host does not invoke the
+	 * factory synchronously (non-TUI hosts); callers then fall back to plain
+	 * `ctx.ui.custom()` calls.
+	 */
+	static open(ui: ExtensionUI): MenuSession | undefined {
+		let session: MenuSession | undefined;
+		let abandoned = false;
+
+		const closed = ui.custom<void>((tui, theme, keybindings, done) => {
+			const component = new MenuSessionComponent();
+			if (abandoned) {
+				// Factory ran after open() returned: close immediately so the host
+				// never keeps an unreachable component in the editor slot.
+				done(undefined);
+				return component;
+			}
+			session = new MenuSession(component, tui, theme, keybindings, () => done(undefined));
+			return component;
+		});
+
+		if (!session) {
+			abandoned = true;
+			void closed.catch(() => {});
+			return undefined;
+		}
+		session.closed = closed;
+		return session;
+	}
+
+	/** Renders one screen inside the open session, resolving when it calls done(). */
+	show<T>(factory: MenuCustomFactory<T>): Promise<T> {
+		return new Promise<T>((resolve) => {
+			let settled = false;
+			const done = (result: T) => {
+				if (settled) return;
+				settled = true;
+				this.component.detachChild();
+				resolve(result);
+			};
+
+			const created = factory(this.tui, this.theme, this.keybindings, done);
+			if (created instanceof Promise) {
+				void created.then((child) => {
+					if (settled) {
+						try {
+							child.dispose?.();
+						} catch {
+							/* ignore dispose errors */
+						}
+						return;
+					}
+					this.mount(child);
+				});
+				return;
+			}
+			this.mount(created);
+		});
+	}
+
+	/** Closes the session, restoring the chat editor once. */
+	async close(): Promise<void> {
+		if (!this.finished) {
+			this.finished = true;
+			this.finish();
+		}
+		await this.closed;
+	}
+
+	private mount(child: MenuSessionChild): void {
+		this.component.setChild(child);
+		this.tui.requestRender();
+	}
+}
+
+/**
+ * Host UI calls that take over the editor slot themselves. The session must be
+ * closed before they run, otherwise the host drops the session component and
+ * its pending promise is never resolved.
+ */
+const EDITOR_SLOT_UI_METHODS = new Set(["select", "confirm", "input", "editor"]);
+
+interface MenuUiScope {
+	ctx: ExtensionCommandContext;
+	close(): Promise<void>;
+}
+
+/**
+ * Wraps a command context so all non-overlay `ctx.ui.custom()` screens share one
+ * menu session. Everything else (notify, status, widgets, ...) is passed through
+ * unchanged; editor-slot prompts close the session first.
+ */
+export function createMenuUiScope(ctx: ExtensionCommandContext): MenuUiScope {
+	if (!ctx.hasUI) return { ctx, close: async () => {} };
+
+	const baseUi = ctx.ui;
+	let session: MenuSession | undefined;
+	let sessionUnavailable = false;
+
+	const closeSession = async (): Promise<void> => {
+		const active = session;
+		session = undefined;
+		if (active) await active.close();
+	};
+
+	const custom = <T>(factory: MenuCustomFactory<T>, options?: CustomOptions): Promise<T> => {
+		// Overlays composite on top of the current content, so they neither
+		// restore the editor nor disturb the session.
+		if (options?.overlay || sessionUnavailable) return baseUi.custom<T>(factory, options);
+		if (!session) {
+			session = MenuSession.open(baseUi);
+			if (!session) {
+				sessionUnavailable = true;
+				return baseUi.custom<T>(factory, options);
+			}
+		}
+		return session.show(factory);
+	};
+
+	const uiProxy = new Proxy(baseUi, {
+		get(target, property) {
+			if (property === "custom") return custom;
+			const value = Reflect.get(target, property, target);
+			if (typeof value !== "function") return value;
+			if (typeof property === "string" && EDITOR_SLOT_UI_METHODS.has(property)) {
+				return async (...args: unknown[]) => {
+					await closeSession();
+					return (value as (...callArgs: unknown[]) => unknown).apply(target, args);
+				};
+			}
+			return (value as (...callArgs: unknown[]) => unknown).bind(target);
+		},
+	}) as ExtensionUI;
+
+	const ctxProxy = new Proxy(ctx, {
+		get(target, property) {
+			if (property === "ui") return uiProxy;
+			const value = Reflect.get(target, property, target);
+			return typeof value === "function"
+				? (value as (...callArgs: unknown[]) => unknown).bind(target)
+				: value;
+		},
+	}) as ExtensionCommandContext;
+
+	return { ctx: ctxProxy, close: closeSession };
+}
+
+/** Runs a command flow with menu screens sharing one custom UI session. */
+async function withMenuUi<T>(
+	ctx: ExtensionCommandContext,
+	run: (menuCtx: ExtensionCommandContext) => Promise<T>,
+): Promise<T> {
+	const scope = createMenuUiScope(ctx);
+	try {
+		return await run(scope.ctx);
+	} finally {
+		await scope.close();
+	}
+}
+
+export async function showWrappedSelect(
 	ctx: ExtensionCommandContext,
 	options: {
 		title: string;
@@ -851,13 +1129,14 @@ async function showWrappedSelect(
 async function runQuotaChecks(
 	accounts: QuotaAccount[],
 	signal?: AbortSignal,
+	context?: QuotaCheckContext,
 ): Promise<QuotaCheckResult[]> {
 	const results = await Promise.all(accounts.map(async (account) => {
 		const checker = PROVIDER_QUOTA_CHECKERS.find(
 			(candidate) => candidate.baseProvider === account.baseProvider,
 		);
 		if (!checker) return undefined;
-		return checker.check(account, signal);
+		return checker.check(account, signal, context);
 	}));
 
 	return results
@@ -869,8 +1148,12 @@ async function loadQuotaResults(
 	ctx: ExtensionCommandContext,
 	accounts: QuotaAccount[],
 ): Promise<QuotaCheckResult[] | null> {
+	const context: QuotaCheckContext = {
+		modelRegistry: ctx.modelRegistry,
+		modelId: ctx.model && getBaseProvider(ctx.model.provider) === "anthropic" ? ctx.model.id : undefined,
+	};
 	if (!ctx.hasUI) {
-		return runQuotaChecks(accounts);
+		return runQuotaChecks(accounts, ctx.signal, context);
 	}
 
 	return ctx.ui.custom<QuotaCheckResult[] | null>((tui, theme, _kb, done) => {
@@ -881,7 +1164,7 @@ async function loadQuotaResults(
 		);
 		loader.onAbort = () => done(null);
 
-		runQuotaChecks(accounts, loader.signal)
+		runQuotaChecks(accounts, loader.signal, context)
 			.then(done)
 			.catch((error) => {
 				if (loader.signal.aborted) {
@@ -1354,6 +1637,164 @@ function collectQuotaAccounts(ctx: ExtensionContext): QuotaAccount[] {
 	return accounts;
 }
 
+const ANTHROPIC_USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage";
+const ANTHROPIC_QUOTA_TIMEOUT_MS = 15_000;
+const ANTHROPIC_QUOTA_WINDOWS = [
+	{ key: "five_hour", label: "5h", family: undefined },
+	{ key: "seven_day", label: "7d", family: undefined },
+	{ key: "seven_day_sonnet", label: "7d Sonnet", family: "sonnet" },
+	{ key: "seven_day_opus", label: "7d Opus", family: "opus" },
+	{ key: "seven_day_oauth_apps", label: "7d OAuth apps", family: undefined },
+] as const;
+
+interface AnthropicQuotaWindow {
+	label: string;
+	remainingPercent?: number;
+	resetAt?: number;
+	applies: boolean;
+}
+
+function parseAnthropicQuotaWindows(data: unknown, modelId?: string): AnthropicQuotaWindow[] {
+	const raw = getRecord(data);
+	// Match model-family tokens, not arbitrary substrings in custom model IDs.
+	const family = modelId?.toLowerCase().match(/^claude-(?:\d+-)*(sonnet|opus)(?:-|$)/)?.[1];
+	return ANTHROPIC_QUOTA_WINDOWS.flatMap(({ key, label, family: windowFamily }, index) => {
+		const value = raw?.[key];
+		// Core windows are required; null/absent optional windows are not advertised limits.
+		if (index >= 2 && value == null) return [];
+		const window = getRecord(value);
+		const used = window?.utilization;
+		const reset = window?.resets_at;
+		const resetAt = typeof reset === "string"
+			&& /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(reset)
+			? parseIsoTimestampSeconds(reset) : undefined;
+		// Date.parse normalizes impossible days (e.g. February 30). Validate the
+		// calendar component separately so legitimate timezone rollovers still work.
+		const validReset = reset == null || (typeof reset === "string" && resetAt !== undefined && resetAt > 0
+			&& new Date(`${reset.slice(0, 10)}T00:00:00Z`).getUTCDate() === Number(reset.slice(8, 10)));
+		const remainingPercent = typeof used === "number" && Number.isFinite(used)
+			&& used >= 0 && used <= 100 && validReset ? 100 - used : undefined;
+		return [{ label, remainingPercent, resetAt: validReset ? resetAt : undefined, applies: !windowFamily || windowFamily === family }];
+	});
+}
+
+function classifyAnthropicQuotaKind(windows: AnthropicQuotaWindow[]): { kind: QuotaStatusKind; score: number } {
+	const applicable = windows.filter((window) => window.applies);
+	// A partial response cannot establish overall headroom, even if another window is healthy.
+	if (applicable.length === 0 || applicable.some((window) => window.remainingPercent === undefined)) {
+		return { kind: "error", score: 0 };
+	}
+	const bottleneck = Math.min(...applicable.map((window) => window.remainingPercent!));
+	if (bottleneck <= 5) return { kind: "blocked", score: bottleneck };
+	if (bottleneck <= 15) return { kind: "low", score: bottleneck };
+	if (bottleneck <= 30) return { kind: "watch", score: bottleneck };
+	return { kind: "ready", score: bottleneck };
+}
+
+const anthropicQuotaChecker: ProviderQuotaChecker = {
+	baseProvider: "anthropic",
+	async check(account, signal, context) {
+		// Never retain tokens in the returned result, including error results.
+		const { auth, ...publicAccount } = account;
+		const unavailable = (summary: string, kind: QuotaStatusKind = "error"): QuotaCheckResult => ({
+			account: publicAccount,
+			kind,
+			summary,
+			details: [
+				`account: ${account.displayName}`,
+				`provider: ${account.providerName}`,
+				`status: ${formatQuotaKind(kind)}`,
+				`details: ${summary}`,
+			],
+			score: 0,
+		});
+		if (auth?.type !== "oauth") {
+			return unavailable("OAuth subscription required — use /subs login or /login (API keys are not supported)", "missing-auth");
+		}
+		if (typeof auth.expires !== "number" || !Number.isFinite(auth.expires)
+			|| (!auth.access && !auth.refresh)) {
+			return unavailable("Incomplete OAuth credentials — use /subs login or /login again", "missing-auth");
+		}
+		if (!context?.modelRegistry?.getProviderAuth) {
+			return unavailable("Native OAuth resolver unavailable — update pi and log in again");
+		}
+
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), ANTHROPIC_QUOTA_TIMEOUT_MS);
+		const requestSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+		let onAbort: () => void = () => {};
+		// Bound auth resolution too: the public registry resolver does not accept a signal.
+		// Pi owns locked refresh/persistence and may finish it after we stop waiting.
+		const aborted = new Promise<never>((_resolve, reject) => {
+			onAbort = () => reject(new Error("Quota check cancelled"));
+			if (requestSignal.aborted) onAbort();
+			else requestSignal.addEventListener("abort", onAbort, { once: true });
+		});
+		let failure = "OAuth resolution failed — use /subs login or /login again";
+		try {
+			return await Promise.race([aborted, (async (): Promise<QuotaCheckResult> => {
+				requestSignal.throwIfAborted();
+				// Re-read/refresh the exact alias via Pi, never refresh from the enumeration snapshot.
+				const resolved = await context.modelRegistry.getProviderAuth(account.providerName);
+				requestSignal.throwIfAborted();
+				if (resolved?.source !== "OAuth" || !resolved.auth.apiKey) {
+					return unavailable("OAuth access unavailable — use /subs login or /login again", "missing-auth");
+				}
+				failure = "Anthropic usage request failed — check connectivity and try again";
+				const response = await fetch(ANTHROPIC_USAGE_ENDPOINT, {
+					method: "GET",
+					headers: {
+						Authorization: `Bearer ${resolved.auth.apiKey}`,
+						Accept: "application/json",
+						"anthropic-beta": "oauth-2025-04-20",
+					},
+					redirect: "error",
+					signal: requestSignal,
+				});
+				if (!response.ok) {
+					// Do not read or echo response bodies/statusText; they may contain sensitive data.
+					void response.body?.cancel().catch(() => {});
+					const hint = response.status === 401 ? "log in again with /subs login or /login"
+						: response.status === 403 ? "quota access denied; verify subscription access and log in again"
+						: response.status === 429 ? "usage endpoint rate limited; try again later"
+							: "usage unavailable; try again later";
+					return unavailable(`HTTP ${response.status} — ${hint}`);
+				}
+				failure = "Anthropic returned invalid usage data — try again later";
+				const windows = parseAnthropicQuotaWindows(await response.json(), context.modelId);
+				requestSignal.throwIfAborted();
+				const classification = classifyAnthropicQuotaKind(windows);
+				const summary = [
+					...windows.filter((window) => window.applies).map((window) =>
+						`${window.label} ${formatRemainingPercent(window.remainingPercent)} (${formatResetShort(window.resetAt)})`),
+					classification.kind === "error" ? "quota unknown" : formatQuotaKind(classification.kind),
+				].join(" | ");
+				return {
+					account: publicAccount,
+					...classification,
+					summary,
+					details: [
+						`account: ${account.displayName}`,
+						`provider: ${account.providerName}`,
+						`status: ${formatQuotaKind(classification.kind)}`,
+						...windows.map((window) =>
+							`${window.label}: ${formatRemainingPercent(window.remainingPercent)} left, resets ${formatResetLong(window.resetAt)}${window.applies ? "" : " (model-specific; not scored)"}`),
+						"Scoring: shared windows plus the requested Sonnet/Opus family, when known; -- means unknown.",
+						"Extra usage billing is separate and is not included in subscription headroom.",
+						`endpoint: ${ANTHROPIC_USAGE_ENDPOINT}`,
+					],
+				};
+			})()]);
+		} catch {
+			return unavailable(signal?.aborted ? "Anthropic quota check cancelled"
+				: controller.signal.aborted ? "Anthropic quota check timed out — try again later" : failure);
+		} finally {
+			clearTimeout(timer);
+			requestSignal.removeEventListener("abort", onAbort);
+		}
+	},
+};
+
 const codexQuotaChecker: ProviderQuotaChecker = {
 	baseProvider: "openai-codex",
 	async check(account: QuotaAccount, signal?: AbortSignal): Promise<QuotaCheckResult> {
@@ -1478,6 +1919,7 @@ const googleAntigravityQuotaChecker: ProviderQuotaChecker = {
 };
 
 const PROVIDER_QUOTA_CHECKERS: ProviderQuotaChecker[] = [
+	anthropicQuotaChecker,
 	codexQuotaChecker,
 	googleGeminiCliQuotaChecker,
 	googleAntigravityQuotaChecker,
@@ -2707,6 +3149,8 @@ class PoolManager {
 		currentProvider: string,
 		authStorage: { hasAuth(provider: string): boolean; get(provider: string): unknown },
 		excludeProviders?: Set<string>,
+		context?: QuotaCheckContext,
+		signal?: AbortSignal,
 	): Promise<string | undefined> {
 		const available = this.getAvailableMembers(pool, authStorage);
 		const eligible = available.filter(
@@ -2724,7 +3168,7 @@ class PoolManager {
 		}));
 
 		try {
-			const results = await runQuotaChecks(accounts);
+			const results = await runQuotaChecks(accounts, signal, context);
 			if (results.length === 0) return undefined;
 			// runQuotaChecks returns sorted best-first.
 			const best = results[0];
@@ -2764,6 +3208,8 @@ class PoolManager {
 					currentModel.provider,
 					getAuthStorage(ctx),
 					cascade.attemptedProviders,
+					{ modelRegistry: ctx.modelRegistry, modelId: currentModel.id },
+					ctx.signal,
 				);
 				if (best) {
 					const bestIdx = plan.candidates.findIndex(
@@ -2919,7 +3365,8 @@ class PoolManager {
 		lastUserPrompt: string | null,
 		config: MultiPassConfig,
 	): Promise<boolean> {
-		if (!currentModel) return false;
+		const signal = ctx.signal;
+		if (signal?.aborted || !currentModel) return false;
 		if (!isRateLimitError(errorMessage)) return false;
 
 		const pool = this.getPoolForProvider(currentModel.provider);
@@ -2950,6 +3397,8 @@ class PoolManager {
 			cascade,
 			lastUserPrompt,
 		);
+		// A cancelled quota lookup is not permission to fall back to rotation.
+		if (signal?.aborted) return false;
 
 		const continuation = formatFailoverContinuation(plan.candidates[0]);
 		for (const skip of plan.skips) {
@@ -2981,6 +3430,7 @@ class PoolManager {
 		}
 
 		const success = await this.pi.setModel(nextModel);
+		if (signal?.aborted) return false;
 		if (!success) {
 			ctx.ui.notify(
 				`[pool:${nextCandidate.poolName}] ${nextCandidate.provider} skipped (authentication unavailable during switch); cascade exhausted; no later eligible target`,
@@ -5410,7 +5860,7 @@ async function handleSubsMenu(
 		{ value: "logout", label: "logout", description: "Logout from a subscription" },
 		{ value: "switch", label: "switch", description: "Switch to a different subscription/provider now" },
 		{ value: "status", label: "status", description: "Show auth status and token info" },
-		{ value: "limits", label: "limits", description: "Check built-in quota support (Codex + Google)" },
+		{ value: "limits", label: "limits", description: "Check built-in quota support (Anthropic + Codex + Google)" },
 	];
 	let preferredAction = "list";
 
@@ -5901,39 +6351,40 @@ export default function multiSub(pi: ExtensionAPI) {
 				? filtered.map((s) => ({ value: s, label: s }))
 				: null;
 		},
-		handler: async (args: string, ctx: ExtensionCommandContext) => {
-			const config = loadGlobalConfig();
-			const parts = args.trim().split(/\s+/).filter(Boolean);
-			const subcommand = (parts[0] || "").toLowerCase();
-			const rest = parts.slice(1).join(" ");
-			switch (subcommand) {
-				case "list":
-				case "ls":
-					return handleSubsList(pi, ctx, config, poolManager);
-				case "add":
-				case "new":
-					return handleSubsAdd(pi, ctx);
-				case "remove":
-				case "rm":
-				case "delete":
-					return handleSubsRemove(pi, ctx, poolManager);
-				case "login":
-					return handleSubsLogin(ctx);
-				case "logout":
-					return handleSubsLogout(ctx);
-				case "switch":
-					return handleSubsSwitch(pi, ctx, rest || undefined);
-				case "status":
-				case "info":
-					return handleSubsStatus(ctx);
-				case "limits":
-				case "quota":
-				case "usage":
-					return handleSubsLimits(ctx);
-				default:
-					return handleSubsMenu(pi, ctx, poolManager);
-			}
-		},
+		handler: async (args: string, hostCtx: ExtensionCommandContext) =>
+			withMenuUi(hostCtx, async (ctx) => {
+				const config = loadGlobalConfig();
+				const parts = args.trim().split(/\s+/).filter(Boolean);
+				const subcommand = (parts[0] || "").toLowerCase();
+				const rest = parts.slice(1).join(" ");
+				switch (subcommand) {
+					case "list":
+					case "ls":
+						return handleSubsList(pi, ctx, config, poolManager);
+					case "add":
+					case "new":
+						return handleSubsAdd(pi, ctx);
+					case "remove":
+					case "rm":
+					case "delete":
+						return handleSubsRemove(pi, ctx, poolManager);
+					case "login":
+						return handleSubsLogin(ctx);
+					case "logout":
+						return handleSubsLogout(ctx);
+					case "switch":
+						return handleSubsSwitch(pi, ctx, rest || undefined);
+					case "status":
+					case "info":
+						return handleSubsStatus(ctx);
+					case "limits":
+					case "quota":
+					case "usage":
+						return handleSubsLimits(ctx);
+					default:
+						return handleSubsMenu(pi, ctx, poolManager);
+				}
+			}),
 	});
 
 	// Register /pool command
@@ -5946,61 +6397,62 @@ export default function multiSub(pi: ExtensionAPI) {
 				? filtered.map((s) => ({ value: s, label: s }))
 				: null;
 		},
-		handler: async (args: string, ctx: ExtensionCommandContext) => {
-			const parts = args
-				.trim()
-				.toLowerCase()
-				.split(/\s+/)
-				.filter(Boolean);
-			const subcommand = parts[0] || "";
-			const chainSubcommand = parts[1] || "";
-			const traceSubcommand = parts[1] || "";
-			switch (subcommand) {
-				case "create":
-				case "new":
-					return handlePoolCreate(ctx, poolManager);
-				case "list":
-				case "ls":
-					return handlePoolList(ctx, poolManager);
-				case "chain":
-					switch (chainSubcommand) {
-						case "":
-							return handlePoolChainMenu(ctx, poolManager);
-						case "list":
-						case "ls":
-							return handlePoolChainList(ctx, poolManager);
-						case "toggle":
-							return handlePoolChainToggle(ctx);
-						case "remove":
-						case "rm":
-						case "delete":
-							return handlePoolChainRemove(ctx);
-						case "status":
-						case "info":
-							return handlePoolChainStatus(ctx, poolManager);
-						case "create":
-						case "new":
-							return handlePoolChainCreate(ctx, poolManager);
-						default:
-							return handlePoolChainMenu(ctx, poolManager);
-					}
-				case "toggle":
-					return handlePoolToggle(ctx, poolManager);
-				case "remove":
-				case "rm":
-				case "delete":
-					return handlePoolRemove(ctx, poolManager);
-				case "status":
-				case "info":
-					return handlePoolStatus(ctx, poolManager);
-				case "trace":
-					return handlePoolTrace(ctx, poolManager, traceSubcommand || undefined);
-				case "project":
-					return handlePoolProject(ctx, poolManager);
-				default:
-					return handlePoolMenu(ctx, poolManager);
-			}
-		},
+		handler: async (args: string, hostCtx: ExtensionCommandContext) =>
+			withMenuUi(hostCtx, async (ctx) => {
+				const parts = args
+					.trim()
+					.toLowerCase()
+					.split(/\s+/)
+					.filter(Boolean);
+				const subcommand = parts[0] || "";
+				const chainSubcommand = parts[1] || "";
+				const traceSubcommand = parts[1] || "";
+				switch (subcommand) {
+					case "create":
+					case "new":
+						return handlePoolCreate(ctx, poolManager);
+					case "list":
+					case "ls":
+						return handlePoolList(ctx, poolManager);
+					case "chain":
+						switch (chainSubcommand) {
+							case "":
+								return handlePoolChainMenu(ctx, poolManager);
+							case "list":
+							case "ls":
+								return handlePoolChainList(ctx, poolManager);
+							case "toggle":
+								return handlePoolChainToggle(ctx);
+							case "remove":
+							case "rm":
+							case "delete":
+								return handlePoolChainRemove(ctx);
+							case "status":
+							case "info":
+								return handlePoolChainStatus(ctx, poolManager);
+							case "create":
+							case "new":
+								return handlePoolChainCreate(ctx, poolManager);
+							default:
+								return handlePoolChainMenu(ctx, poolManager);
+						}
+					case "toggle":
+						return handlePoolToggle(ctx, poolManager);
+					case "remove":
+					case "rm":
+					case "delete":
+						return handlePoolRemove(ctx, poolManager);
+					case "status":
+					case "info":
+						return handlePoolStatus(ctx, poolManager);
+					case "trace":
+						return handlePoolTrace(ctx, poolManager, traceSubcommand || undefined);
+					case "project":
+						return handlePoolProject(ctx, poolManager);
+					default:
+						return handlePoolMenu(ctx, poolManager);
+				}
+			}),
 	});
 
 	// Register /mp-preset command (namespaced to avoid collision with pi's built-in /preset)
@@ -6019,39 +6471,40 @@ export default function multiSub(pi: ExtensionAPI) {
 				.map((p) => ({ value: p.name, label: p.name }));
 			return presetNames.length > 0 ? presetNames : null;
 		},
-		handler: async (args: string, ctx: ExtensionCommandContext) => {
-			const parts = args.trim().split(/\s+/).filter(Boolean);
-			const subcommand = (parts[0] || "").toLowerCase();
-			const rest = parts.slice(1).join(" ");
-			switch (subcommand) {
-				case "activate":
-				case "use":
-					return handlePresetActivate(pi, ctx, rest || undefined);
-				case "create":
-				case "new":
-					return handlePresetCreate(ctx);
-				case "list":
-				case "ls":
-					return handlePresetList(ctx);
-				case "toggle":
-					return handlePresetToggle(ctx);
-				case "remove":
-				case "rm":
-				case "delete":
-					return handlePresetRemove(ctx);
-				default:
-					// If the argument matches a preset name, activate it directly
-					if (subcommand) {
-						const config = loadGlobalConfig();
-						const preset = config.presets.find(
-							(p) => p.name.toLowerCase() === subcommand && p.enabled,
-						);
-						if (preset) {
-							return handlePresetActivate(pi, ctx, preset.name);
+		handler: async (args: string, hostCtx: ExtensionCommandContext) =>
+			withMenuUi(hostCtx, async (ctx) => {
+				const parts = args.trim().split(/\s+/).filter(Boolean);
+				const subcommand = (parts[0] || "").toLowerCase();
+				const rest = parts.slice(1).join(" ");
+				switch (subcommand) {
+					case "activate":
+					case "use":
+						return handlePresetActivate(pi, ctx, rest || undefined);
+					case "create":
+					case "new":
+						return handlePresetCreate(ctx);
+					case "list":
+					case "ls":
+						return handlePresetList(ctx);
+					case "toggle":
+						return handlePresetToggle(ctx);
+					case "remove":
+					case "rm":
+					case "delete":
+						return handlePresetRemove(ctx);
+					default:
+						// If the argument matches a preset name, activate it directly
+						if (subcommand) {
+							const config = loadGlobalConfig();
+							const preset = config.presets.find(
+								(p) => p.name.toLowerCase() === subcommand && p.enabled,
+							);
+							if (preset) {
+								return handlePresetActivate(pi, ctx, preset.name);
+							}
 						}
-					}
-					return handlePresetMenu(pi, ctx);
-			}
-		},
+						return handlePresetMenu(pi, ctx);
+				}
+			}),
 	});
 }
