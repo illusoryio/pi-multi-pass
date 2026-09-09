@@ -1,5 +1,5 @@
 // Menu lifecycle checks: chained menu screens must not restore the chat editor
-// between screens (INT-219).
+// between screens.
 //
 // The extension is imported for real (Node type stripping) against minimal
 // stubs for the pi packages, so the assertions run the shipped

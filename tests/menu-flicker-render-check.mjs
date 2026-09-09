@@ -1,4 +1,4 @@
-// Menu lifecycle check against the real pi renderer (INT-219).
+// Menu lifecycle check against the real pi renderer.
 //
 // Runs the shipped createMenuUiScope()/showWrappedSelect() code on the real
 // @earendil-works/pi-tui render pipeline (process.nextTick immediate render
@@ -285,7 +285,7 @@ try {
 		host.tui.stop();
 	}
 
-	// Combined INT-218/219 boundary: the real BorderedLoader is a menu-session
+	// Combined quota/menu boundary: the real BorderedLoader is a menu-session
 	// child. Fake auth/fetch only; no stored credentials or provider calls.
 	for (const cancel of [false, true]) {
 		const host = createHost();
