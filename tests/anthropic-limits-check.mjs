@@ -285,4 +285,22 @@ for (const reset of ["2026-02-30T12:00:00Z", "2025-02-29T12:00:00+02:00", "2026-
 for (const reset of ["2024-02-29T12:00:00Z", "2026-01-31T23:59:59-05:00", "2026-01-01T00:00:00+14:00"]) {
   assert.equal(classify({ ...body(), five_hour: window(0, reset) }).kind, "ready");
 }
+// Model-scoped `limits` entries (e.g. Fable) join model-family windows. percent
+// is utilization on the same 0..100 scale as the named windows.
+const fableLimit = (percent, extra = {}) => ({
+  kind: "weekly_scoped", group: "weekly", percent, severity: "normal",
+  resets_at: "2026-09-13T19:00:00.432929+00:00", is_active: true,
+  scope: { model: { id: null, display_name: "Fable" }, surface: null }, ...extra,
+});
+const unscopedLimit = (percent) => ({ kind: "weekly_all", group: "weekly", percent, severity: "normal", resets_at: null, is_active: false, scope: null });
+assert.equal(classify({ ...body(0, 0), limits: [unscopedLimit(100), { ...fableLimit(100), is_active: true }] }, "claude-fable-5-1").kind, "blocked");
+assert.equal(classify({ ...body(0, 0), limits: [unscopedLimit(100), { ...fableLimit(100), is_active: true }] }, "claude-fable-5-1").kind, "blocked");
+assert.equal(classify({ ...body(0, 0), limits: [fableLimit(20)] }, "claude-fable-5-1").score, 80);
+// Inactive, non-model, and foreign-model entries do not affect other families.
+assert.equal(classify({ ...body(0, 0), limits: [{ ...fableLimit(100), is_active: false }] }, "claude-fable-5-1").kind, "ready");
+assert.equal(classify({ ...body(0, 0), limits: [{ ...fableLimit(100), scope: {} }] }).kind, "ready");
+assert.equal(classify({ ...body(0, 0), limits: [fableLimit(100)] }, "claude-sonnet-4-5").kind, "ready");
+assert.equal(classify({ ...body(0, 0), limits: [fableLimit(101)] }, "claude-fable-5-1").kind, "error");
+const fableWindow = api.parseAnthropicQuotaWindows({ ...body(0, 0), limits: [{ ...fableLimit(30) }] }, "claude-fable-5-1").find((w) => w.label === "7d Fable");
+assert.deepEqual({ ...fableWindow }, { label: "7d Fable", remainingPercent: 70, resetAt: Date.parse("2026-09-13T19:00:00Z") / 1000, applies: true });
 console.log("Anthropic limits checks passed (real source; isolated auth, network, timers and config)");

@@ -1657,25 +1657,48 @@ interface AnthropicQuotaWindow {
 function parseAnthropicQuotaWindows(data: unknown, modelId?: string): AnthropicQuotaWindow[] {
 	const raw = getRecord(data);
 	// Match model-family tokens, not arbitrary substrings in custom model IDs.
-	const family = modelId?.toLowerCase().match(/^claude-(?:\d+-)*(sonnet|opus)(?:-|$)/)?.[1];
-	return ANTHROPIC_QUOTA_WINDOWS.flatMap(({ key, label, family: windowFamily }, index) => {
+	const family = modelId?.toLowerCase().match(/^claude-(?:\d+-)*(sonnet|opus|fable)(?:-|$)/)?.[1];
+	const parseReset = (reset: unknown): { resetAt?: number; valid: boolean } => {
+		if (reset == null) return { valid: true };
+		if (typeof reset !== "string") return { valid: false };
+		const resetAt = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(reset)
+			? parseIsoTimestampSeconds(reset) : undefined;
+		// Date.parse normalizes impossible days (e.g. February 30). Validate the
+		// calendar component separately so legitimate timezone rollovers still work.
+		const valid = resetAt !== undefined && resetAt > 0
+			&& new Date(`${reset.slice(0, 10)}T00:00:00Z`).getUTCDate() === Number(reset.slice(8, 10));
+		return { resetAt: valid ? resetAt : undefined, valid };
+	};
+	const named = ANTHROPIC_QUOTA_WINDOWS.flatMap(({ key, label, family: windowFamily }, index) => {
 		const value = raw?.[key];
 		// Core windows are required; null/absent optional windows are not advertised limits.
 		if (index >= 2 && value == null) return [];
 		const window = getRecord(value);
 		const used = window?.utilization;
-		const reset = window?.resets_at;
-		const resetAt = typeof reset === "string"
-			&& /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(reset)
-			? parseIsoTimestampSeconds(reset) : undefined;
-		// Date.parse normalizes impossible days (e.g. February 30). Validate the
-		// calendar component separately so legitimate timezone rollovers still work.
-		const validReset = reset == null || (typeof reset === "string" && resetAt !== undefined && resetAt > 0
-			&& new Date(`${reset.slice(0, 10)}T00:00:00Z`).getUTCDate() === Number(reset.slice(8, 10)));
+		const { resetAt, valid } = parseReset(window?.resets_at);
 		const remainingPercent = typeof used === "number" && Number.isFinite(used)
-			&& used >= 0 && used <= 100 && validReset ? 100 - used : undefined;
-		return [{ label, remainingPercent, resetAt: validReset ? resetAt : undefined, applies: !windowFamily || windowFamily === family }];
+			&& used >= 0 && used <= 100 && valid ? 100 - used : undefined;
+		return [{ label, remainingPercent, resetAt, applies: !windowFamily || windowFamily === family }];
 	});
+	// Newer usage responses add a model-scoped `limits` array (e.g. a Fable
+	// entry) alongside the named windows. These are utilization percentages on
+	// the same 0..100 scale; only active model-scoped entries are advertised
+	// limits. Unscoped entries duplicate the named windows and are ignored.
+	const scoped = (Array.isArray(raw?.limits) ? raw.limits : []).flatMap((entry) => {
+		const limit = getRecord(entry);
+		const model = getRecord(getRecord(limit?.scope)?.model);
+		const displayName = typeof model?.display_name === "string" && model.display_name.trim()
+			? model.display_name : undefined;
+		if (!displayName || limit?.is_active !== true) return [];
+		const windowFamily = displayName.toLowerCase();
+		const used = limit?.percent;
+		const { resetAt, valid } = parseReset(limit?.resets_at);
+		const remainingPercent = typeof used === "number" && Number.isFinite(used)
+			&& used >= 0 && used <= 100 && valid ? 100 - used : undefined;
+		const label = `${limit?.kind === "session" ? "5h" : "7d"} ${displayName}`;
+		return [{ label, remainingPercent, resetAt, applies: windowFamily === family }];
+	});
+	return [...named, ...scoped];
 }
 
 function classifyAnthropicQuotaKind(windows: AnthropicQuotaWindow[]): { kind: QuotaStatusKind; score: number } {
