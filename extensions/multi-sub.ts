@@ -50,6 +50,8 @@ import type {
 	ExtensionCommandContext,
 	ExtensionContext,
 	AgentEndEvent,
+	KeybindingsManager,
+	Theme,
 } from "@earendil-works/pi-coding-agent";
 import {
 	BorderedLoader,
@@ -70,7 +72,9 @@ import {
 	SelectList,
 	Text,
 	matchesKey,
+	type Component,
 	type SelectItem,
+	type TUI,
 } from "@earendil-works/pi-tui";
 
 // ==========================================================================
@@ -762,7 +766,276 @@ function getWrappedSelectIndex(items: SelectItem[], value: string | undefined): 
 	return index >= 0 ? index : 0;
 }
 
-async function showWrappedSelect(
+// ==========================================================================
+// Menu session: keep one custom UI open across chained menus
+// ==========================================================================
+
+/**
+ * Every menu screen used to be its own `ctx.ui.custom()` call. The TUI host
+ * closes a non-overlay custom component by restoring the chat editor inside
+ * `done()` (interactive-mode `showExtensionCustom` -> `restoreEditor`), and
+ * `TUI.handleTerminalInput()` schedules the resulting frame on
+ * `process.nextTick` right after the component handled the key. Node drains
+ * that tick before the promise continuation that opens the next screen, so
+ * pressing Enter rendered one full chat-editor frame between menus.
+ *
+ * A menu session opens a single `ctx.ui.custom()` for a whole command flow and
+ * swaps the rendered child in place, so the editor is restored exactly once,
+ * when the flow ends.
+ */
+type MenuSessionChild = Component & { dispose?(): void };
+
+type MenuCustomFactory<T> = (
+	tui: TUI,
+	theme: Theme,
+	keybindings: KeybindingsManager,
+	done: (result: T) => void,
+) => MenuSessionChild | Promise<MenuSessionChild>;
+
+type ExtensionUI = ExtensionCommandContext["ui"];
+type CustomOptions = Parameters<ExtensionUI["custom"]>[1];
+type MouseEventArg = Parameters<NonNullable<Component["handleMouse"]>>[0];
+
+/** Host-facing component that renders whichever menu screen is currently active. */
+class MenuSessionComponent implements Component {
+	private child: MenuSessionChild | undefined;
+	private acceptsInput = false;
+
+	setChild(child: MenuSessionChild): void {
+		if (this.child && this.child !== child) this.releaseChild(this.child);
+		this.child = child;
+		this.acceptsInput = true;
+		if ("focused" in child) (child as MenuSessionChild & { focused: boolean }).focused = true;
+	}
+
+	/**
+	 * Stop routing input to a screen that already resolved, while keeping its
+	 * last frame on screen until the next screen mounts (no blank frame, no
+	 * input delivered to a dead screen).
+	 */
+	detachChild(): void {
+		this.acceptsInput = false;
+	}
+
+	render(width: number): string[] {
+		return this.child ? this.child.render(width) : [];
+	}
+
+	invalidate(): void {
+		this.child?.invalidate();
+	}
+
+	handleInput(data: string): void {
+		if (!this.acceptsInput) return;
+		this.child?.handleInput?.(data);
+	}
+
+	handleMouse(event: MouseEventArg): ReturnType<NonNullable<Component["handleMouse"]>> {
+		if (!this.acceptsInput) return undefined;
+		return this.child?.handleMouse?.(event);
+	}
+
+	dispose(): void {
+		if (this.child) this.releaseChild(this.child);
+		this.child = undefined;
+		this.acceptsInput = false;
+	}
+
+	private releaseChild(child: MenuSessionChild): void {
+		if ("focused" in child) (child as MenuSessionChild & { focused: boolean }).focused = false;
+		try {
+			child.dispose?.();
+		} catch {
+			/* ignore dispose errors, same as the host does */
+		}
+	}
+}
+
+/** One long-lived `ctx.ui.custom()` that hosts a sequence of menu screens. */
+class MenuSession {
+	private closed: Promise<void> | undefined;
+	private finished = false;
+	private readonly component: MenuSessionComponent;
+	private readonly tui: TUI;
+	private readonly theme: Theme;
+	private readonly keybindings: KeybindingsManager;
+	private readonly finish: () => void;
+
+	private constructor(
+		component: MenuSessionComponent,
+		tui: TUI,
+		theme: Theme,
+		keybindings: KeybindingsManager,
+		finish: () => void,
+	) {
+		this.component = component;
+		this.tui = tui;
+		this.theme = theme;
+		this.keybindings = keybindings;
+		this.finish = finish;
+	}
+
+	/**
+	 * Opens the session. Returns undefined when the host does not invoke the
+	 * factory synchronously (non-TUI hosts); callers then fall back to plain
+	 * `ctx.ui.custom()` calls.
+	 */
+	static open(ui: ExtensionUI): MenuSession | undefined {
+		let session: MenuSession | undefined;
+		let abandoned = false;
+
+		const closed = ui.custom<void>((tui, theme, keybindings, done) => {
+			const component = new MenuSessionComponent();
+			if (abandoned) {
+				// Factory ran after open() returned: close immediately so the host
+				// never keeps an unreachable component in the editor slot.
+				done(undefined);
+				return component;
+			}
+			session = new MenuSession(component, tui, theme, keybindings, () => done(undefined));
+			return component;
+		});
+
+		if (!session) {
+			abandoned = true;
+			void closed.catch(() => {});
+			return undefined;
+		}
+		session.closed = closed;
+		return session;
+	}
+
+	/** Renders one screen inside the open session, resolving when it calls done(). */
+	show<T>(factory: MenuCustomFactory<T>): Promise<T> {
+		return new Promise<T>((resolve) => {
+			let settled = false;
+			const done = (result: T) => {
+				if (settled) return;
+				settled = true;
+				this.component.detachChild();
+				resolve(result);
+			};
+
+			const created = factory(this.tui, this.theme, this.keybindings, done);
+			if (created instanceof Promise) {
+				void created.then((child) => {
+					if (settled) {
+						try {
+							child.dispose?.();
+						} catch {
+							/* ignore dispose errors */
+						}
+						return;
+					}
+					this.mount(child);
+				});
+				return;
+			}
+			this.mount(created);
+		});
+	}
+
+	/** Closes the session, restoring the chat editor once. */
+	async close(): Promise<void> {
+		if (!this.finished) {
+			this.finished = true;
+			this.finish();
+		}
+		await this.closed;
+	}
+
+	private mount(child: MenuSessionChild): void {
+		this.component.setChild(child);
+		this.tui.requestRender();
+	}
+}
+
+/**
+ * Host UI calls that take over the editor slot themselves. The session must be
+ * closed before they run, otherwise the host drops the session component and
+ * its pending promise is never resolved.
+ */
+const EDITOR_SLOT_UI_METHODS = new Set(["select", "confirm", "input", "editor"]);
+
+interface MenuUiScope {
+	ctx: ExtensionCommandContext;
+	close(): Promise<void>;
+}
+
+/**
+ * Wraps a command context so all non-overlay `ctx.ui.custom()` screens share one
+ * menu session. Everything else (notify, status, widgets, ...) is passed through
+ * unchanged; editor-slot prompts close the session first.
+ */
+export function createMenuUiScope(ctx: ExtensionCommandContext): MenuUiScope {
+	if (!ctx.hasUI) return { ctx, close: async () => {} };
+
+	const baseUi = ctx.ui;
+	let session: MenuSession | undefined;
+	let sessionUnavailable = false;
+
+	const closeSession = async (): Promise<void> => {
+		const active = session;
+		session = undefined;
+		if (active) await active.close();
+	};
+
+	const custom = <T>(factory: MenuCustomFactory<T>, options?: CustomOptions): Promise<T> => {
+		// Overlays composite on top of the current content, so they neither
+		// restore the editor nor disturb the session.
+		if (options?.overlay || sessionUnavailable) return baseUi.custom<T>(factory, options);
+		if (!session) {
+			session = MenuSession.open(baseUi);
+			if (!session) {
+				sessionUnavailable = true;
+				return baseUi.custom<T>(factory, options);
+			}
+		}
+		return session.show(factory);
+	};
+
+	const uiProxy = new Proxy(baseUi, {
+		get(target, property) {
+			if (property === "custom") return custom;
+			const value = Reflect.get(target, property, target);
+			if (typeof value !== "function") return value;
+			if (typeof property === "string" && EDITOR_SLOT_UI_METHODS.has(property)) {
+				return async (...args: unknown[]) => {
+					await closeSession();
+					return (value as (...callArgs: unknown[]) => unknown).apply(target, args);
+				};
+			}
+			return (value as (...callArgs: unknown[]) => unknown).bind(target);
+		},
+	}) as ExtensionUI;
+
+	const ctxProxy = new Proxy(ctx, {
+		get(target, property) {
+			if (property === "ui") return uiProxy;
+			const value = Reflect.get(target, property, target);
+			return typeof value === "function"
+				? (value as (...callArgs: unknown[]) => unknown).bind(target)
+				: value;
+		},
+	}) as ExtensionCommandContext;
+
+	return { ctx: ctxProxy, close: closeSession };
+}
+
+/** Runs a command flow with menu screens sharing one custom UI session. */
+async function withMenuUi<T>(
+	ctx: ExtensionCommandContext,
+	run: (menuCtx: ExtensionCommandContext) => Promise<T>,
+): Promise<T> {
+	const scope = createMenuUiScope(ctx);
+	try {
+		return await run(scope.ctx);
+	} finally {
+		await scope.close();
+	}
+}
+
+export async function showWrappedSelect(
 	ctx: ExtensionCommandContext,
 	options: {
 		title: string;
@@ -5587,7 +5860,7 @@ async function handleSubsMenu(
 		{ value: "logout", label: "logout", description: "Logout from a subscription" },
 		{ value: "switch", label: "switch", description: "Switch to a different subscription/provider now" },
 		{ value: "status", label: "status", description: "Show auth status and token info" },
-		{ value: "limits", label: "limits", description: "Check built-in quota support (Codex + Google)" },
+		{ value: "limits", label: "limits", description: "Check built-in quota support (Anthropic + Codex + Google)" },
 	];
 	let preferredAction = "list";
 
@@ -6078,39 +6351,40 @@ export default function multiSub(pi: ExtensionAPI) {
 				? filtered.map((s) => ({ value: s, label: s }))
 				: null;
 		},
-		handler: async (args: string, ctx: ExtensionCommandContext) => {
-			const config = loadGlobalConfig();
-			const parts = args.trim().split(/\s+/).filter(Boolean);
-			const subcommand = (parts[0] || "").toLowerCase();
-			const rest = parts.slice(1).join(" ");
-			switch (subcommand) {
-				case "list":
-				case "ls":
-					return handleSubsList(pi, ctx, config, poolManager);
-				case "add":
-				case "new":
-					return handleSubsAdd(pi, ctx);
-				case "remove":
-				case "rm":
-				case "delete":
-					return handleSubsRemove(pi, ctx, poolManager);
-				case "login":
-					return handleSubsLogin(ctx);
-				case "logout":
-					return handleSubsLogout(ctx);
-				case "switch":
-					return handleSubsSwitch(pi, ctx, rest || undefined);
-				case "status":
-				case "info":
-					return handleSubsStatus(ctx);
-				case "limits":
-				case "quota":
-				case "usage":
-					return handleSubsLimits(ctx);
-				default:
-					return handleSubsMenu(pi, ctx, poolManager);
-			}
-		},
+		handler: async (args: string, hostCtx: ExtensionCommandContext) =>
+			withMenuUi(hostCtx, async (ctx) => {
+				const config = loadGlobalConfig();
+				const parts = args.trim().split(/\s+/).filter(Boolean);
+				const subcommand = (parts[0] || "").toLowerCase();
+				const rest = parts.slice(1).join(" ");
+				switch (subcommand) {
+					case "list":
+					case "ls":
+						return handleSubsList(pi, ctx, config, poolManager);
+					case "add":
+					case "new":
+						return handleSubsAdd(pi, ctx);
+					case "remove":
+					case "rm":
+					case "delete":
+						return handleSubsRemove(pi, ctx, poolManager);
+					case "login":
+						return handleSubsLogin(ctx);
+					case "logout":
+						return handleSubsLogout(ctx);
+					case "switch":
+						return handleSubsSwitch(pi, ctx, rest || undefined);
+					case "status":
+					case "info":
+						return handleSubsStatus(ctx);
+					case "limits":
+					case "quota":
+					case "usage":
+						return handleSubsLimits(ctx);
+					default:
+						return handleSubsMenu(pi, ctx, poolManager);
+				}
+			}),
 	});
 
 	// Register /pool command
@@ -6123,61 +6397,62 @@ export default function multiSub(pi: ExtensionAPI) {
 				? filtered.map((s) => ({ value: s, label: s }))
 				: null;
 		},
-		handler: async (args: string, ctx: ExtensionCommandContext) => {
-			const parts = args
-				.trim()
-				.toLowerCase()
-				.split(/\s+/)
-				.filter(Boolean);
-			const subcommand = parts[0] || "";
-			const chainSubcommand = parts[1] || "";
-			const traceSubcommand = parts[1] || "";
-			switch (subcommand) {
-				case "create":
-				case "new":
-					return handlePoolCreate(ctx, poolManager);
-				case "list":
-				case "ls":
-					return handlePoolList(ctx, poolManager);
-				case "chain":
-					switch (chainSubcommand) {
-						case "":
-							return handlePoolChainMenu(ctx, poolManager);
-						case "list":
-						case "ls":
-							return handlePoolChainList(ctx, poolManager);
-						case "toggle":
-							return handlePoolChainToggle(ctx);
-						case "remove":
-						case "rm":
-						case "delete":
-							return handlePoolChainRemove(ctx);
-						case "status":
-						case "info":
-							return handlePoolChainStatus(ctx, poolManager);
-						case "create":
-						case "new":
-							return handlePoolChainCreate(ctx, poolManager);
-						default:
-							return handlePoolChainMenu(ctx, poolManager);
-					}
-				case "toggle":
-					return handlePoolToggle(ctx, poolManager);
-				case "remove":
-				case "rm":
-				case "delete":
-					return handlePoolRemove(ctx, poolManager);
-				case "status":
-				case "info":
-					return handlePoolStatus(ctx, poolManager);
-				case "trace":
-					return handlePoolTrace(ctx, poolManager, traceSubcommand || undefined);
-				case "project":
-					return handlePoolProject(ctx, poolManager);
-				default:
-					return handlePoolMenu(ctx, poolManager);
-			}
-		},
+		handler: async (args: string, hostCtx: ExtensionCommandContext) =>
+			withMenuUi(hostCtx, async (ctx) => {
+				const parts = args
+					.trim()
+					.toLowerCase()
+					.split(/\s+/)
+					.filter(Boolean);
+				const subcommand = parts[0] || "";
+				const chainSubcommand = parts[1] || "";
+				const traceSubcommand = parts[1] || "";
+				switch (subcommand) {
+					case "create":
+					case "new":
+						return handlePoolCreate(ctx, poolManager);
+					case "list":
+					case "ls":
+						return handlePoolList(ctx, poolManager);
+					case "chain":
+						switch (chainSubcommand) {
+							case "":
+								return handlePoolChainMenu(ctx, poolManager);
+							case "list":
+							case "ls":
+								return handlePoolChainList(ctx, poolManager);
+							case "toggle":
+								return handlePoolChainToggle(ctx);
+							case "remove":
+							case "rm":
+							case "delete":
+								return handlePoolChainRemove(ctx);
+							case "status":
+							case "info":
+								return handlePoolChainStatus(ctx, poolManager);
+							case "create":
+							case "new":
+								return handlePoolChainCreate(ctx, poolManager);
+							default:
+								return handlePoolChainMenu(ctx, poolManager);
+						}
+					case "toggle":
+						return handlePoolToggle(ctx, poolManager);
+					case "remove":
+					case "rm":
+					case "delete":
+						return handlePoolRemove(ctx, poolManager);
+					case "status":
+					case "info":
+						return handlePoolStatus(ctx, poolManager);
+					case "trace":
+						return handlePoolTrace(ctx, poolManager, traceSubcommand || undefined);
+					case "project":
+						return handlePoolProject(ctx, poolManager);
+					default:
+						return handlePoolMenu(ctx, poolManager);
+				}
+			}),
 	});
 
 	// Register /mp-preset command (namespaced to avoid collision with pi's built-in /preset)
@@ -6196,39 +6471,40 @@ export default function multiSub(pi: ExtensionAPI) {
 				.map((p) => ({ value: p.name, label: p.name }));
 			return presetNames.length > 0 ? presetNames : null;
 		},
-		handler: async (args: string, ctx: ExtensionCommandContext) => {
-			const parts = args.trim().split(/\s+/).filter(Boolean);
-			const subcommand = (parts[0] || "").toLowerCase();
-			const rest = parts.slice(1).join(" ");
-			switch (subcommand) {
-				case "activate":
-				case "use":
-					return handlePresetActivate(pi, ctx, rest || undefined);
-				case "create":
-				case "new":
-					return handlePresetCreate(ctx);
-				case "list":
-				case "ls":
-					return handlePresetList(ctx);
-				case "toggle":
-					return handlePresetToggle(ctx);
-				case "remove":
-				case "rm":
-				case "delete":
-					return handlePresetRemove(ctx);
-				default:
-					// If the argument matches a preset name, activate it directly
-					if (subcommand) {
-						const config = loadGlobalConfig();
-						const preset = config.presets.find(
-							(p) => p.name.toLowerCase() === subcommand && p.enabled,
-						);
-						if (preset) {
-							return handlePresetActivate(pi, ctx, preset.name);
+		handler: async (args: string, hostCtx: ExtensionCommandContext) =>
+			withMenuUi(hostCtx, async (ctx) => {
+				const parts = args.trim().split(/\s+/).filter(Boolean);
+				const subcommand = (parts[0] || "").toLowerCase();
+				const rest = parts.slice(1).join(" ");
+				switch (subcommand) {
+					case "activate":
+					case "use":
+						return handlePresetActivate(pi, ctx, rest || undefined);
+					case "create":
+					case "new":
+						return handlePresetCreate(ctx);
+					case "list":
+					case "ls":
+						return handlePresetList(ctx);
+					case "toggle":
+						return handlePresetToggle(ctx);
+					case "remove":
+					case "rm":
+					case "delete":
+						return handlePresetRemove(ctx);
+					default:
+						// If the argument matches a preset name, activate it directly
+						if (subcommand) {
+							const config = loadGlobalConfig();
+							const preset = config.presets.find(
+								(p) => p.name.toLowerCase() === subcommand && p.enabled,
+							);
+							if (preset) {
+								return handlePresetActivate(pi, ctx, preset.name);
+							}
 						}
-					}
-					return handlePresetMenu(pi, ctx);
-			}
-		},
+						return handlePresetMenu(pi, ctx);
+				}
+			}),
 	});
 }

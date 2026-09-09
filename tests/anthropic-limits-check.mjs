@@ -10,7 +10,8 @@ import vm from "node:vm";
 const source = readFileSync(new URL("../extensions/multi-sub.ts", import.meta.url), "utf8");
 const code = stripTypeScriptTypes(source, { mode: "transform" })
   .replace(/^import[\s\S]*?from\s+["'][^"']+["'];\s*/gm, "")
-  .replace("export default function multiSub", "function multiSub");
+  .replace("export default function multiSub", "function multiSub")
+  .replace(/^export (?=(?:async )?function )/gm, "");
 let fetchImpl = () => { throw new Error("Unexpected network request"); };
 let deadline;
 let timerCount = 0;
