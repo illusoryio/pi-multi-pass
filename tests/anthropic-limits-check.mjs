@@ -236,6 +236,29 @@ fetchImpl = async () => Response.json({});
 assert.equal(await manager.getQuotaBestMember(pool, "anthropic", registry.authStorage, undefined, context), undefined);
 assert.equal(timerCount, 0);
 
+// 5h-reset-first: earliest known 5h reset wins among fully usable accounts.
+const pool5h = { ...pool, strategy: "5h-reset-first" };
+const earliest5h = async () => manager.getEarliest5hResetMember(pool5h, "anthropic", registry.authStorage, undefined, context);
+fetchImpl = async (_url, options) => Response.json(options.headers.Authorization.endsWith("-2")
+  ? body(50, 30) // 5h remaining 50, resets 2026-10-01
+  : { five_hour: window(10, "2026-10-03T12:00:00Z"), seven_day: window(30) });
+assert.equal(await earliest5h(), "anthropic-2");
+// Fable exhausted on the earliest-reset account: excluded only for fable models.
+fetchImpl = async (_url, options) => Response.json(options.headers.Authorization.endsWith("-2")
+  ? { ...body(50, 30), limits: [fableLimit(100)] }
+  : { five_hour: window(10, "2026-10-03T12:00:00Z"), seven_day: window(30) });
+assert.equal(await earliest5h(), "anthropic-2"); // scoped Fable does not apply to sonnet
+assert.equal(await manager.getEarliest5hResetMember(pool5h, "anthropic", registry.authStorage, undefined, { ...context, modelId: "claude-fable-5-1" }), "anthropic-3");
+// Unknown 5h reset sorts after a known one.
+fetchImpl = async (_url, options) => Response.json(options.headers.Authorization.endsWith("-2")
+  ? body(50, 30)
+  : { five_hour: window(10, null), seven_day: window(30) });
+assert.equal(await earliest5h(), "anthropic-2");
+// No candidate qualifies on 5h-reset ordering: fall back to score order.
+fetchImpl = async () => Response.json(body(100, 100));
+assert.ok(["anthropic-2", "anthropic-3"].includes(await earliest5h()));
+assert.equal(timerCount, 0);
+
 // Full caller: Esc during quota-first must not turn unavailable quota into a
 // round-robin switch and a fresh queued prompt. All planning/checker code is real.
 for (const phase of ["auth", "fetch", "body"]) {
