@@ -405,9 +405,14 @@ interface QuotaCheckResult {
 	score: number;
 }
 
+interface QuotaCheckContext {
+	modelRegistry: ExtensionContext["modelRegistry"];
+	modelId?: string;
+}
+
 interface ProviderQuotaChecker {
 	baseProvider: string;
-	check(account: QuotaAccount, signal?: AbortSignal): Promise<QuotaCheckResult>;
+	check(account: QuotaAccount, signal?: AbortSignal, context?: QuotaCheckContext): Promise<QuotaCheckResult>;
 }
 
 interface CodexUsageWindow {
@@ -851,13 +856,14 @@ async function showWrappedSelect(
 async function runQuotaChecks(
 	accounts: QuotaAccount[],
 	signal?: AbortSignal,
+	context?: QuotaCheckContext,
 ): Promise<QuotaCheckResult[]> {
 	const results = await Promise.all(accounts.map(async (account) => {
 		const checker = PROVIDER_QUOTA_CHECKERS.find(
 			(candidate) => candidate.baseProvider === account.baseProvider,
 		);
 		if (!checker) return undefined;
-		return checker.check(account, signal);
+		return checker.check(account, signal, context);
 	}));
 
 	return results
@@ -869,8 +875,12 @@ async function loadQuotaResults(
 	ctx: ExtensionCommandContext,
 	accounts: QuotaAccount[],
 ): Promise<QuotaCheckResult[] | null> {
+	const context: QuotaCheckContext = {
+		modelRegistry: ctx.modelRegistry,
+		modelId: ctx.model && getBaseProvider(ctx.model.provider) === "anthropic" ? ctx.model.id : undefined,
+	};
 	if (!ctx.hasUI) {
-		return runQuotaChecks(accounts);
+		return runQuotaChecks(accounts, ctx.signal, context);
 	}
 
 	return ctx.ui.custom<QuotaCheckResult[] | null>((tui, theme, _kb, done) => {
@@ -881,7 +891,7 @@ async function loadQuotaResults(
 		);
 		loader.onAbort = () => done(null);
 
-		runQuotaChecks(accounts, loader.signal)
+		runQuotaChecks(accounts, loader.signal, context)
 			.then(done)
 			.catch((error) => {
 				if (loader.signal.aborted) {
@@ -1354,6 +1364,164 @@ function collectQuotaAccounts(ctx: ExtensionContext): QuotaAccount[] {
 	return accounts;
 }
 
+const ANTHROPIC_USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage";
+const ANTHROPIC_QUOTA_TIMEOUT_MS = 15_000;
+const ANTHROPIC_QUOTA_WINDOWS = [
+	{ key: "five_hour", label: "5h", family: undefined },
+	{ key: "seven_day", label: "7d", family: undefined },
+	{ key: "seven_day_sonnet", label: "7d Sonnet", family: "sonnet" },
+	{ key: "seven_day_opus", label: "7d Opus", family: "opus" },
+	{ key: "seven_day_oauth_apps", label: "7d OAuth apps", family: undefined },
+] as const;
+
+interface AnthropicQuotaWindow {
+	label: string;
+	remainingPercent?: number;
+	resetAt?: number;
+	applies: boolean;
+}
+
+function parseAnthropicQuotaWindows(data: unknown, modelId?: string): AnthropicQuotaWindow[] {
+	const raw = getRecord(data);
+	// Match model-family tokens, not arbitrary substrings in custom model IDs.
+	const family = modelId?.toLowerCase().match(/^claude-(?:\d+-)*(sonnet|opus)(?:-|$)/)?.[1];
+	return ANTHROPIC_QUOTA_WINDOWS.flatMap(({ key, label, family: windowFamily }, index) => {
+		const value = raw?.[key];
+		// Core windows are required; null/absent optional windows are not advertised limits.
+		if (index >= 2 && value == null) return [];
+		const window = getRecord(value);
+		const used = window?.utilization;
+		const reset = window?.resets_at;
+		const resetAt = typeof reset === "string"
+			&& /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(reset)
+			? parseIsoTimestampSeconds(reset) : undefined;
+		// Date.parse normalizes impossible days (e.g. February 30). Validate the
+		// calendar component separately so legitimate timezone rollovers still work.
+		const validReset = reset == null || (typeof reset === "string" && resetAt !== undefined && resetAt > 0
+			&& new Date(`${reset.slice(0, 10)}T00:00:00Z`).getUTCDate() === Number(reset.slice(8, 10)));
+		const remainingPercent = typeof used === "number" && Number.isFinite(used)
+			&& used >= 0 && used <= 100 && validReset ? 100 - used : undefined;
+		return [{ label, remainingPercent, resetAt: validReset ? resetAt : undefined, applies: !windowFamily || windowFamily === family }];
+	});
+}
+
+function classifyAnthropicQuotaKind(windows: AnthropicQuotaWindow[]): { kind: QuotaStatusKind; score: number } {
+	const applicable = windows.filter((window) => window.applies);
+	// A partial response cannot establish overall headroom, even if another window is healthy.
+	if (applicable.length === 0 || applicable.some((window) => window.remainingPercent === undefined)) {
+		return { kind: "error", score: 0 };
+	}
+	const bottleneck = Math.min(...applicable.map((window) => window.remainingPercent!));
+	if (bottleneck <= 5) return { kind: "blocked", score: bottleneck };
+	if (bottleneck <= 15) return { kind: "low", score: bottleneck };
+	if (bottleneck <= 30) return { kind: "watch", score: bottleneck };
+	return { kind: "ready", score: bottleneck };
+}
+
+const anthropicQuotaChecker: ProviderQuotaChecker = {
+	baseProvider: "anthropic",
+	async check(account, signal, context) {
+		// Never retain tokens in the returned result, including error results.
+		const { auth, ...publicAccount } = account;
+		const unavailable = (summary: string, kind: QuotaStatusKind = "error"): QuotaCheckResult => ({
+			account: publicAccount,
+			kind,
+			summary,
+			details: [
+				`account: ${account.displayName}`,
+				`provider: ${account.providerName}`,
+				`status: ${formatQuotaKind(kind)}`,
+				`details: ${summary}`,
+			],
+			score: 0,
+		});
+		if (auth?.type !== "oauth") {
+			return unavailable("OAuth subscription required — use /subs login or /login (API keys are not supported)", "missing-auth");
+		}
+		if (typeof auth.expires !== "number" || !Number.isFinite(auth.expires)
+			|| (!auth.access && !auth.refresh)) {
+			return unavailable("Incomplete OAuth credentials — use /subs login or /login again", "missing-auth");
+		}
+		if (!context?.modelRegistry?.getProviderAuth) {
+			return unavailable("Native OAuth resolver unavailable — update pi and log in again");
+		}
+
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), ANTHROPIC_QUOTA_TIMEOUT_MS);
+		const requestSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+		let onAbort: () => void = () => {};
+		// Bound auth resolution too: the public registry resolver does not accept a signal.
+		// Pi owns locked refresh/persistence and may finish it after we stop waiting.
+		const aborted = new Promise<never>((_resolve, reject) => {
+			onAbort = () => reject(new Error("Quota check cancelled"));
+			if (requestSignal.aborted) onAbort();
+			else requestSignal.addEventListener("abort", onAbort, { once: true });
+		});
+		let failure = "OAuth resolution failed — use /subs login or /login again";
+		try {
+			return await Promise.race([aborted, (async (): Promise<QuotaCheckResult> => {
+				requestSignal.throwIfAborted();
+				// Re-read/refresh the exact alias via Pi, never refresh from the enumeration snapshot.
+				const resolved = await context.modelRegistry.getProviderAuth(account.providerName);
+				requestSignal.throwIfAborted();
+				if (resolved?.source !== "OAuth" || !resolved.auth.apiKey) {
+					return unavailable("OAuth access unavailable — use /subs login or /login again", "missing-auth");
+				}
+				failure = "Anthropic usage request failed — check connectivity and try again";
+				const response = await fetch(ANTHROPIC_USAGE_ENDPOINT, {
+					method: "GET",
+					headers: {
+						Authorization: `Bearer ${resolved.auth.apiKey}`,
+						Accept: "application/json",
+						"anthropic-beta": "oauth-2025-04-20",
+					},
+					redirect: "error",
+					signal: requestSignal,
+				});
+				if (!response.ok) {
+					// Do not read or echo response bodies/statusText; they may contain sensitive data.
+					void response.body?.cancel().catch(() => {});
+					const hint = response.status === 401 ? "log in again with /subs login or /login"
+						: response.status === 403 ? "quota access denied; verify subscription access and log in again"
+						: response.status === 429 ? "usage endpoint rate limited; try again later"
+							: "usage unavailable; try again later";
+					return unavailable(`HTTP ${response.status} — ${hint}`);
+				}
+				failure = "Anthropic returned invalid usage data — try again later";
+				const windows = parseAnthropicQuotaWindows(await response.json(), context.modelId);
+				requestSignal.throwIfAborted();
+				const classification = classifyAnthropicQuotaKind(windows);
+				const summary = [
+					...windows.filter((window) => window.applies).map((window) =>
+						`${window.label} ${formatRemainingPercent(window.remainingPercent)} (${formatResetShort(window.resetAt)})`),
+					classification.kind === "error" ? "quota unknown" : formatQuotaKind(classification.kind),
+				].join(" | ");
+				return {
+					account: publicAccount,
+					...classification,
+					summary,
+					details: [
+						`account: ${account.displayName}`,
+						`provider: ${account.providerName}`,
+						`status: ${formatQuotaKind(classification.kind)}`,
+						...windows.map((window) =>
+							`${window.label}: ${formatRemainingPercent(window.remainingPercent)} left, resets ${formatResetLong(window.resetAt)}${window.applies ? "" : " (model-specific; not scored)"}`),
+						"Scoring: shared windows plus the requested Sonnet/Opus family, when known; -- means unknown.",
+						"Extra usage billing is separate and is not included in subscription headroom.",
+						`endpoint: ${ANTHROPIC_USAGE_ENDPOINT}`,
+					],
+				};
+			})()]);
+		} catch {
+			return unavailable(signal?.aborted ? "Anthropic quota check cancelled"
+				: controller.signal.aborted ? "Anthropic quota check timed out — try again later" : failure);
+		} finally {
+			clearTimeout(timer);
+			requestSignal.removeEventListener("abort", onAbort);
+		}
+	},
+};
+
 const codexQuotaChecker: ProviderQuotaChecker = {
 	baseProvider: "openai-codex",
 	async check(account: QuotaAccount, signal?: AbortSignal): Promise<QuotaCheckResult> {
@@ -1478,6 +1646,7 @@ const googleAntigravityQuotaChecker: ProviderQuotaChecker = {
 };
 
 const PROVIDER_QUOTA_CHECKERS: ProviderQuotaChecker[] = [
+	anthropicQuotaChecker,
 	codexQuotaChecker,
 	googleGeminiCliQuotaChecker,
 	googleAntigravityQuotaChecker,
@@ -2707,6 +2876,8 @@ class PoolManager {
 		currentProvider: string,
 		authStorage: { hasAuth(provider: string): boolean; get(provider: string): unknown },
 		excludeProviders?: Set<string>,
+		context?: QuotaCheckContext,
+		signal?: AbortSignal,
 	): Promise<string | undefined> {
 		const available = this.getAvailableMembers(pool, authStorage);
 		const eligible = available.filter(
@@ -2724,7 +2895,7 @@ class PoolManager {
 		}));
 
 		try {
-			const results = await runQuotaChecks(accounts);
+			const results = await runQuotaChecks(accounts, signal, context);
 			if (results.length === 0) return undefined;
 			// runQuotaChecks returns sorted best-first.
 			const best = results[0];
@@ -2764,6 +2935,8 @@ class PoolManager {
 					currentModel.provider,
 					getAuthStorage(ctx),
 					cascade.attemptedProviders,
+					{ modelRegistry: ctx.modelRegistry, modelId: currentModel.id },
+					ctx.signal,
 				);
 				if (best) {
 					const bestIdx = plan.candidates.findIndex(
@@ -2919,7 +3092,8 @@ class PoolManager {
 		lastUserPrompt: string | null,
 		config: MultiPassConfig,
 	): Promise<boolean> {
-		if (!currentModel) return false;
+		const signal = ctx.signal;
+		if (signal?.aborted || !currentModel) return false;
 		if (!isRateLimitError(errorMessage)) return false;
 
 		const pool = this.getPoolForProvider(currentModel.provider);
@@ -2950,6 +3124,8 @@ class PoolManager {
 			cascade,
 			lastUserPrompt,
 		);
+		// A cancelled quota lookup is not permission to fall back to rotation.
+		if (signal?.aborted) return false;
 
 		const continuation = formatFailoverContinuation(plan.candidates[0]);
 		for (const skip of plan.skips) {
@@ -2981,6 +3157,7 @@ class PoolManager {
 		}
 
 		const success = await this.pi.setModel(nextModel);
+		if (signal?.aborted) return false;
 		if (!success) {
 			ctx.ui.notify(
 				`[pool:${nextCandidate.poolName}] ${nextCandidate.provider} skipped (authentication unavailable during switch); cascade exhausted; no later eligible target`,

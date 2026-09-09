@@ -39,7 +39,7 @@ pi install git:github.com/hjanuschka/pi-multi-pass
 /subs add              Pick a provider, add a subscription
 /login                 Authenticate the new subscription
 /subs switch           Manually switch to another subscription/provider
-/subs limits           Check built-in quota support (Codex + Google)
+/subs limits           Check built-in quota support (Anthropic + Codex + Google)
 /pool create           Group subs into a rotation pool (with strategy selection)
 /pool chain create     Build an ordered fallback chain across pools
 /pool trace start      Start recording routing decisions for this session
@@ -62,7 +62,7 @@ When one account hits a rate limit during an assistant turn, multi-pass automati
 /subs switch       Manually switch to a subscription/provider now
 /subs list         List subscriptions with auth status; select one for quick actions
 /subs status       Detailed status (token expiry, pool membership)
-/subs limits       Check built-in quota/usage support (Codex + Google)
+/subs limits       Check built-in quota/usage support (Anthropic + Codex + Google)
 ```
 
 ### `/pool` -- Rotation pool and chain management
@@ -206,7 +206,7 @@ All strategies fall back to round-robin when their specific data is unavailable.
 
 You have 3 Codex accounts in a pool. Account A has 80% of its 5-hour window left, account B has 20%, account C has 60%. On failover, `quota-first` picks account A first instead of just the next one in rotation order.
 
-Uses the same built-in quota checkers as `/subs limits` (currently Codex and Google providers).
+Uses the same built-in quota checkers as `/subs limits` (currently Anthropic, Codex and Google providers).
 
 ```json
 {
@@ -383,9 +383,14 @@ Presets work with pools: if an entry's provider belongs to a pool, rate-limit fa
 
 Currently implemented:
 
+- `anthropic`: fetches Claude Pro/Max subscription usage from `https://api.anthropic.com/api/oauth/usage` for the base account and configured extra Anthropic subscriptions, using saved OAuth authentication (not Console API keys).
 - `openai-codex`: fetches ChatGPT/Codex usage from `https://chatgpt.com/backend-api/wham/usage` (or `CHATGPT_BASE_URL`), then summarizes the 5-hour and 7-day subscription windows for the base account and any configured extra Codex subscriptions.
 - `google-gemini-cli`: refreshes the saved Google OAuth session when needed, then queries `https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota` and summarizes the returned Gemini quota buckets by their bottleneck family (for example `Pro` or `Flash`).
 - `google-antigravity`: refreshes the saved Antigravity OAuth session when needed, then queries `v1internal:fetchAvailableModels` on the Google Cloud Code Assist endpoints with Antigravity-style headers and summarizes the returned model-level bottleneck.
+
+Anthropic reports 5-hour and 7-day shared windows, plus Sonnet, Opus and OAuth-app windows when returned. The details view shows each supported window's remaining percentage and reset time. Scoring uses the lowest remaining percentage across shared windows (including OAuth apps, when present) and the requested Sonnet/Opus family's window. `/subs limits` uses the active Anthropic model's family; with another provider active it scores shared windows only. Other families' windows are shown but do not make every model look exhausted. `quota-first` uses the model being routed. Missing or malformed core windows, or malformed applicable optional windows, make overall quota unknown rather than healthy. Missing reset timestamps display as unknown, not an invented reset. Extra-usage billing and unrecognized windows are not included in subscription headroom; no monetary balance or paid-overage availability is inferred.
+
+The Anthropic usage endpoint is undocumented and may change or deny access for some accounts. Checks are on demand, make one usage request with no HTTP retries, and stop waiting after 15 seconds (including auth resolution and response reading). Cancellation stops the usage lookup. Pi's native OAuth resolver owns locked refresh and persistence for the exact account; because its public registry API has no cancellation parameter, an already-started native refresh may finish after the quota check is cancelled or times out. The extension never writes refreshed Anthropic tokens itself. HTTP 401/403, rate limiting, and network failures produce sanitized unavailable results, not proof that subscription quota is exhausted.
 
 Google quota is not a single flat subscription bucket, so the details view shows one line per returned Gemini family or Antigravity model with its remaining headroom and reset time.
 
