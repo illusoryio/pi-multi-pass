@@ -2851,6 +2851,32 @@ class PoolManager {
 	private pi: ExtensionAPI;
 	private cascadeState: FailoverCascadeState | null = null;
 	private suppressNextStartTurn = false;
+	private retryPrompt: string | null = null;
+
+	isWaitingForRetry(): boolean {
+		return this.retryPrompt !== null;
+	}
+
+	clearRetryWait(): void {
+		this.retryPrompt = null;
+	}
+
+	/** Commands may take over a native retry, but must drain it before replay. */
+	async switchSubscription(model: Model<Api>, ctx: ExtensionCommandContext): Promise<boolean> {
+		const prompt = ctx.isIdle() ? null : this.retryPrompt;
+		this.clearRetryWait(); // Claim once, before any await or cancellation event.
+		if (prompt && !ctx.isIdle()) {
+			ctx.abort();
+			await ctx.waitForIdle();
+		}
+		const success = await this.pi.setModel(model);
+		if (success && prompt) {
+			this.suppressNextStartTurn = true;
+			this.pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+			this.recordTrace(`resumed interrupted retry on ${model.provider} (${model.id})`);
+		}
+		return success;
+	}
 	private traceEnabled = false;
 	private routingTrace: RoutingTraceEntry[] = [];
 
@@ -3489,6 +3515,7 @@ class PoolManager {
 			this.pi.sendUserMessage(lastUserPrompt, { deliverAs: "followUp" });
 			this.recordTrace("queued follow-up because pi will not retry this error");
 		} else if (piWillRetryTurn(errorMessage)) {
+			this.retryPrompt = lastUserPrompt;
 			this.recordTrace("waiting for pi to retry the turn");
 		} else {
 			this.recordTrace("turn cannot be replayed because no prompt was captured");
@@ -3607,6 +3634,7 @@ async function handleSubsSwitch(
 	pi: ExtensionAPI,
 	ctx: ExtensionCommandContext,
 	requestedProviderName?: string,
+	poolManager?: PoolManager,
 ): Promise<void> {
 	const options = getSwitchableProviderOptions(ctx);
 	if (options.length === 0) {
@@ -3646,12 +3674,15 @@ async function handleSubsSwitch(
 		ctx.ui.notify(`No selectable models found for ${selected.label}.`, "error");
 		return;
 	}
-	if (ctx.model?.provider === nextModel.provider && ctx.model?.id === nextModel.id) {
+	if (ctx.model?.provider === nextModel.provider && ctx.model?.id === nextModel.id
+		&& !poolManager?.isWaitingForRetry()) {
 		ctx.ui.notify(`Already using ${selected.label} (${nextModel.id}).`, "info");
 		return;
 	}
 
-	const success = await pi.setModel(nextModel);
+	const success = poolManager
+		? await poolManager.switchSubscription(nextModel, ctx)
+		: await pi.setModel(nextModel);
 	if (!success) {
 		ctx.ui.notify(`Failed to switch to ${selected.label}.`, "error");
 		return;
@@ -5920,7 +5951,7 @@ async function handleSubsMenu(
 				await handleSubsLogout(ctx);
 				break;
 			case "switch":
-				await handleSubsSwitch(pi, ctx);
+				await handleSubsSwitch(pi, ctx, undefined, poolManager);
 				break;
 			case "status":
 				await handleSubsStatus(ctx);
@@ -6324,6 +6355,12 @@ export default function multiSub(pi: ExtensionAPI) {
 		poolManager.startTurn(event.prompt, ctx.model);
 	});
 
+	// Native retries use agent_start (not before_agent_start). Once a retry
+	// starts or settles, a later manual switch must not replay the old prompt.
+	pi.on("agent_start", () => poolManager.clearRetryWait());
+	pi.on("agent_settled", () => poolManager.clearRetryWait());
+	pi.on("session_shutdown", () => poolManager.clearRetryWait());
+
 	// Listen for errors to trigger pool rotation
 	pi.on("agent_end", async (event: AgentEndEvent, ctx: ExtensionContext) => {
 		if (!event.messages || event.messages.length === 0) return;
@@ -6334,6 +6371,9 @@ export default function multiSub(pi: ExtensionAPI) {
 		const assistantMsg = lastMsg as any;
 		if (assistantMsg.stopReason !== "error") return;
 		if (!assistantMsg.errorMessage) return;
+		// The active model can change while the failed request is winding down.
+		// Never charge that old account's error to the newly selected account.
+		if (assistantMsg.provider !== ctx.model?.provider || assistantMsg.model !== ctx.model?.id) return;
 
 		const effective = loadEffectiveConfig(ctx.cwd);
 		const rotated = await poolManager.handleError(
@@ -6400,7 +6440,7 @@ export default function multiSub(pi: ExtensionAPI) {
 					case "logout":
 						return handleSubsLogout(ctx);
 					case "switch":
-						return handleSubsSwitch(pi, ctx, rest || undefined);
+						return handleSubsSwitch(pi, ctx, rest || undefined, poolManager);
 					case "status":
 					case "info":
 						return handleSubsStatus(ctx);

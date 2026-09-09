@@ -1,4 +1,8 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { stripTypeScriptTypes } from "node:module";
+import { join } from "node:path";
+import vm from "node:vm";
 
 function getChainEntryIssue(entry, config, modelRegistry) {
   const pool = config.pools.find((candidate) => candidate.name === entry.pool);
@@ -749,6 +753,136 @@ async function runRetryStartTurnChecks() {
   console.log("retry-start-turn checks passed");
 }
 
+// Run the actual extension lifecycle and /subs command, not RuntimeHarness's
+// historical algorithm copy. No production imports, credentials or network.
+async function runManualRetryChecks() {
+  const source = readFileSync(process.env.FAILOVER_SOURCE || new URL("../extensions/multi-sub.ts", import.meta.url), "utf8");
+  const code = stripTypeScriptTypes(source, { mode: "transform" })
+    .replace(/^import[\s\S]*?from\s+["'][^"']+["'];\s*/gm, "")
+    .replace("export default function multiSub", "function multiSub")
+    .replace(/^export (?=(?:async )?function )/gm, "");
+
+  async function fixture() {
+    const config = createConfig();
+    config.chains = [];
+    config.pools = [config.pools[0]];
+    config.subscriptions = [{ provider: "anthropic", index: 2 }, { provider: "anthropic", index: 3 }];
+    config.presets = [];
+    const events = new Map();
+    const commands = new Map();
+    const actions = [];
+    let idle = false;
+    let model = { provider: "anthropic", id: "claude-sonnet-4" };
+    const controller = new AbortController();
+    const ctx = {
+      cwd: "/fixture", signal: controller.signal,
+      get model() { return model; },
+      modelRegistry: {
+        authStorage: createAuthStorage(["anthropic", "anthropic-2", "anthropic-3"]),
+        find: (provider, id) => ({ provider, id }),
+      },
+      ui: { notify() {}, setStatus() {} },
+      isIdle: () => idle,
+      abort: () => { actions.push("abortRetry"); controller.abort(); },
+      waitForIdle: async () => {
+        actions.push("retry cancelled; drained");
+        idle = true;
+        await emit("agent_settled", {});
+      },
+    };
+    const emit = async (name, event) => {
+      for (const handler of events.get(name) || []) await handler(event, ctx);
+    };
+    const pi = {
+      on: (name, handler) => events.set(name, [...(events.get(name) || []), handler]),
+      registerCommand: (name, command) => commands.set(name, command),
+      registerProvider() {},
+      setModel: async (next) => {
+        actions.push(`set:${next.provider}`);
+        if (pi.failSwitch) return false;
+        const previousModel = model;
+        model = next;
+        await emit("model_select", { model, previousModel, source: "set" });
+        return true;
+      },
+      sendUserMessage: (prompt, options) => {
+        assert.equal(prompt, "finish the migration");
+        assert.equal(options.deliverAs, "followUp");
+        assert.equal(idle, true, "continuation must wait until stale retry drains");
+        actions.push(`prompt:${model.provider}`);
+      },
+    };
+    const sandbox = vm.createContext({
+      console, process: { env: {} }, join, AbortController, Date,
+      getAgentDir: () => "/fixture-agent", existsSync: () => false,
+      readStoredCredential: () => { throw new Error("Unexpected credential read"); },
+      fetch: () => { throw new Error("Unexpected network call"); },
+    });
+    vm.runInContext(`${code}\nthis.api = { multiSub };\nloadGlobalConfig = () => fixtureConfig;\nloadEffectiveConfig = () => fixtureConfig;\nregisterSub = () => {};`, sandbox);
+    sandbox.fixtureConfig = config;
+    sandbox.api.multiSub(pi);
+    await emit("before_agent_start", { prompt: "finish the migration" });
+    await emit("agent_start", {});
+    const error = async (provider = "anthropic", message = "429 rate limit") => emit("agent_end", {
+      messages: [{ role: "assistant", provider, model: "claude-sonnet-4", stopReason: "error", errorMessage: message }],
+    });
+    return { actions, pi, ctx, emit, error, controller,
+      switchTo: (provider) => commands.get("subs").handler(`switch ${provider}`, ctx),
+      settle: async () => { idle = true; await emit("agent_settled", {}); },
+    };
+  }
+
+  // 429 A -> automatic B -> native backoff -> explicit C takes ownership.
+  const f = await fixture();
+  await f.error();
+  assert.deepEqual(f.actions, ["set:anthropic-2"], "429 remains owned by native retry until manual switch");
+  await f.switchTo("anthropic-3");
+  assert.deepEqual(f.actions, ["set:anthropic-2", "abortRetry", "retry cancelled; drained", "set:anthropic-3", "prompt:anthropic-3"]);
+  const count = f.actions.length;
+  await f.error("anthropic", "429 stale rate limit");
+  await f.error("anthropic", "Retry failed after 1 attempts: Retry cancelled");
+  await f.switchTo("anthropic-3");
+  assert.equal(f.actions.length, count, "stale errors and repeated selection must not rotate or double-prompt");
+
+  const same = await fixture();
+  await same.error();
+  await same.switchTo("anthropic-2");
+  assert.equal(same.actions.at(-1), "prompt:anthropic-2", "explicitly selecting the automatic target resumes once too");
+
+  for (const boundary of ["agent_start", "agent_settled", "session_shutdown"]) {
+    const f = await fixture();
+    await f.error();
+    await f.emit(boundary, {});
+    await f.switchTo("anthropic-3");
+    assert.deepEqual(f.actions, ["set:anthropic-2", "set:anthropic-3"], `${boundary} clears retry ownership`);
+  }
+  const idle = await fixture();
+  await idle.error();
+  await idle.settle();
+  await idle.switchTo("anthropic-3");
+  assert.deepEqual(idle.actions, ["set:anthropic-2", "set:anthropic-3"]);
+
+  const invalid = await fixture();
+  await invalid.error();
+  await invalid.switchTo("missing");
+  assert.deepEqual(invalid.actions, ["set:anthropic-2"], "invalid target leaves native retry alone");
+  await invalid.switchTo("anthropic-3");
+  assert.equal(invalid.actions.at(-1), "prompt:anthropic-3");
+
+  const failed = await fixture();
+  await failed.error();
+  failed.pi.failSwitch = true;
+  await failed.switchTo("anthropic-3");
+  assert.equal(failed.actions.some((a) => a.startsWith("prompt:")), false, "failed switch never replays");
+
+  const aborted = await fixture();
+  aborted.controller.abort();
+  await aborted.error();
+  assert.deepEqual(aborted.actions, [], "pre-cancelled agent_end must not switch/replay");
+  console.log("manual retry lifecycle checks passed (real source; fake auth/registry; no providers)");
+}
+
+await runManualRetryChecks();
 runCoreChecks();
 runSessionStatusChecks();
 await runReplayDeliveryChecks();

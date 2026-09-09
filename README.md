@@ -65,6 +65,8 @@ When one account hits a rate limit during an assistant turn, multi-pass automati
 /subs limits       Check built-in quota/usage support (Anthropic + Codex + Google)
 ```
 
+If `/subs switch` selects a subscription while multi-pass is waiting for Pi's automatic retry, it cancels and drains that retry, then resumes the interrupted prompt once on the selected subscription. Selecting the already auto-rotated target also resumes it. An idle switch does not replay an earlier prompt; a failed switch does not resume.
+
 ### `/pool` -- Rotation pool and chain management
 
 ```
