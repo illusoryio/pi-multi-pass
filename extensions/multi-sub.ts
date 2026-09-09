@@ -1652,6 +1652,8 @@ interface AnthropicQuotaWindow {
 	remainingPercent?: number;
 	resetAt?: number;
 	applies: boolean;
+	/** Model-scoped `limits[]` entry: always shown, scored only when the family matches. */
+	scoped?: boolean;
 }
 
 function parseAnthropicQuotaWindows(data: unknown, modelId?: string): AnthropicQuotaWindow[] {
@@ -1696,7 +1698,7 @@ function parseAnthropicQuotaWindows(data: unknown, modelId?: string): AnthropicQ
 		const remainingPercent = typeof used === "number" && Number.isFinite(used)
 			&& used >= 0 && used <= 100 && valid ? 100 - used : undefined;
 		const label = `${limit?.kind === "session" ? "5h" : "7d"} ${displayName}`;
-		return [{ label, remainingPercent, resetAt, applies: windowFamily === family }];
+		return [{ label, remainingPercent, resetAt, applies: windowFamily === family, scoped: true }];
 	});
 	return [...named, ...scoped];
 }
@@ -1788,7 +1790,9 @@ const anthropicQuotaChecker: ProviderQuotaChecker = {
 				requestSignal.throwIfAborted();
 				const classification = classifyAnthropicQuotaKind(windows);
 				const summary = [
-					...windows.filter((window) => window.applies).map((window) =>
+					// Model-scoped limits (e.g. Fable) always appear as their own column
+					// on the overview list; they are scored only for their own family.
+					...windows.filter((window) => window.applies || window.scoped).map((window) =>
 						`${window.label} ${formatRemainingPercent(window.remainingPercent)} (${formatResetShort(window.resetAt)})`),
 					classification.kind === "error" ? "quota unknown" : formatQuotaKind(classification.kind),
 				].join(" | ");
@@ -1802,7 +1806,7 @@ const anthropicQuotaChecker: ProviderQuotaChecker = {
 						`status: ${formatQuotaKind(classification.kind)}`,
 						...windows.map((window) =>
 							`${window.label}: ${formatRemainingPercent(window.remainingPercent)} left, resets ${formatResetLong(window.resetAt)}${window.applies ? "" : " (model-specific; not scored)"}`),
-						"Scoring: shared windows plus the requested Sonnet/Opus family, when known; -- means unknown.",
+						"Scoring: shared windows plus the requested model family's window (Sonnet/Opus/Fable or model-scoped limits), when known; -- means unknown.",
 						"Extra usage billing is separate and is not included in subscription headroom.",
 						`endpoint: ${ANTHROPIC_USAGE_ENDPOINT}`,
 					],
