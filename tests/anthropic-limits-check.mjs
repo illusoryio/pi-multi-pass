@@ -55,6 +55,12 @@ let resolver = async (provider) => {
 const registry = { getProviderAuth: (provider) => resolver(provider) };
 const context = { modelRegistry: registry, modelId: "claude-sonnet-4-5" };
 const check = (value = account, signal, options = context) => api.anthropicQuotaChecker.check(value, signal, options);
+const fableLimit = (percent, extra = {}) => ({
+  kind: "weekly_scoped", group: "weekly", percent, severity: "normal",
+  resets_at: "2026-09-13T19:00:00.432929+00:00", is_active: true,
+  scope: { model: { id: null, display_name: "Fable" }, surface: null }, ...extra,
+});
+const unscopedLimit = (percent) => ({ kind: "weekly_all", group: "weekly", percent, severity: "normal", resets_at: null, is_active: false, scope: null });
 const visible = (result) => JSON.stringify(result);
 const assertSafe = (result) => assert.doesNotMatch(visible(result), /fixture-.*secret|SENSITIVE|statusText/);
 
@@ -115,6 +121,17 @@ for (const value of [undefined, { type: "api_key", key: "fixture-api-secret" }, 
 }
 assert.equal(fetchCalls, 1);
 assert.match((await check(account, undefined, {})).summary, /resolver unavailable/);
+// With no limits array there is no Fable column; with one, it always appears.
+let scopedResult = await check();
+assert.doesNotMatch(scopedResult.summary, /Fable/);
+fetchImpl = async () => Response.json({ ...specific, limits: [fableLimit(100)] });
+scopedResult = await check();
+assert.match(scopedResult.summary, /7d Fable 0% \(/);
+assert.equal(scopedResult.kind, "blocked"); // sonnet still active model; shared windows bottleneck
+scopedResult = await check(account, undefined, { ...context, modelId: "claude-fable-5-1" });
+assert.match(scopedResult.summary, /7d Fable 0% \(/);
+assert.equal(scopedResult.kind, "blocked");
+fetchImpl = async () => Response.json(specific);
 
 for (const status of [401, 403, 429, 500]) {
   let requests = 0;
@@ -287,12 +304,7 @@ for (const reset of ["2024-02-29T12:00:00Z", "2026-01-31T23:59:59-05:00", "2026-
 }
 // Model-scoped `limits` entries (e.g. Fable) join model-family windows. percent
 // is utilization on the same 0..100 scale as the named windows.
-const fableLimit = (percent, extra = {}) => ({
-  kind: "weekly_scoped", group: "weekly", percent, severity: "normal",
-  resets_at: "2026-09-13T19:00:00.432929+00:00", is_active: true,
-  scope: { model: { id: null, display_name: "Fable" }, surface: null }, ...extra,
-});
-const unscopedLimit = (percent) => ({ kind: "weekly_all", group: "weekly", percent, severity: "normal", resets_at: null, is_active: false, scope: null });
+assert.equal(classify({ ...body(0, 0), limits: [unscopedLimit(100), { ...fableLimit(100), is_active: true }] }, "claude-fable-5-1").kind, "blocked");
 assert.equal(classify({ ...body(0, 0), limits: [unscopedLimit(100), { ...fableLimit(100), is_active: true }] }, "claude-fable-5-1").kind, "blocked");
 assert.equal(classify({ ...body(0, 0), limits: [unscopedLimit(100), { ...fableLimit(100), is_active: true }] }, "claude-fable-5-1").kind, "blocked");
 assert.equal(classify({ ...body(0, 0), limits: [fableLimit(20)] }, "claude-fable-5-1").score, 80);
@@ -302,5 +314,5 @@ assert.equal(classify({ ...body(0, 0), limits: [{ ...fableLimit(100), scope: {} 
 assert.equal(classify({ ...body(0, 0), limits: [fableLimit(100)] }, "claude-sonnet-4-5").kind, "ready");
 assert.equal(classify({ ...body(0, 0), limits: [fableLimit(101)] }, "claude-fable-5-1").kind, "error");
 const fableWindow = api.parseAnthropicQuotaWindows({ ...body(0, 0), limits: [{ ...fableLimit(30) }] }, "claude-fable-5-1").find((w) => w.label === "7d Fable");
-assert.deepEqual({ ...fableWindow }, { label: "7d Fable", remainingPercent: 70, resetAt: Date.parse("2026-09-13T19:00:00Z") / 1000, applies: true });
+assert.deepEqual({ ...fableWindow }, { label: "7d Fable", remainingPercent: 70, resetAt: Date.parse("2026-09-13T19:00:00Z") / 1000, applies: true, scoped: true });
 console.log("Anthropic limits checks passed (real source; isolated auth, network, timers and config)");
