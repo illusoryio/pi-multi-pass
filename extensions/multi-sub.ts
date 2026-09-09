@@ -407,6 +407,8 @@ interface QuotaCheckResult {
 	summary: string;
 	details: string[];
 	score: number;
+	/** Structured per-window data; only the Anthropic checker provides it. */
+	windows?: AnthropicQuotaWindow[];
 }
 
 interface QuotaCheckContext {
@@ -1810,6 +1812,7 @@ const anthropicQuotaChecker: ProviderQuotaChecker = {
 						"Extra usage billing is separate and is not included in subscription headroom.",
 						`endpoint: ${ANTHROPIC_USAGE_ENDPOINT}`,
 					],
+					windows,
 				};
 			})()]);
 		} catch {
@@ -2013,11 +2016,16 @@ interface SubEntry {
  *  - "quota-first": query built-in quota checkers and prefer the member
  *    with the most remaining quota. Falls back to round-robin when no
  *    quota data is available.
+ *  - "5h-reset-first": drain usable allowance from accounts whose 5-hour
+ *    window resets soonest. Accounts blocked by any applicable window
+ *    (shared 5h/7d or the active model's scoped limit, e.g. Fable) are
+ *    excluded; unknown applicable window data is not treated as available.
+ *    Falls back to the quota-first score order when no account qualifies.
  *  - "scheduled": use per-member time-window schedules to pick the best
  *    member. Preferred members in their active window go first (shortest
  *    remaining window first), then default members, then overflow.
  *  - "custom": delegate selection to a user-provided JS script. */
-type PoolStrategy = "round-robin" | "quota-first" | "scheduled" | "custom";
+type PoolStrategy = "round-robin" | "quota-first" | "5h-reset-first" | "scheduled" | "custom";
 
 type DayOfWeek = "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun";
 const ALL_DAYS: readonly DayOfWeek[] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"] as const;
@@ -3235,6 +3243,72 @@ class PoolManager {
 	}
 
 	/**
+	 * "5h-reset-first" ranking: among members whose applicable windows all
+	 * still have allowance, prefer the one whose 5-hour window resets soonest
+	 * (draining near-expiry allowance first). Accounts with unknown 5h reset
+	 * sort after known ones. If no account qualifies on its own windows, fall
+	 * back to the quota-first score order (runQuotaChecks sorts best-first).
+	 */
+	async getEarliest5hResetMember(
+		pool: PoolConfig,
+		currentProvider: string,
+		authStorage: { hasAuth(provider: string): boolean; get(provider: string): unknown },
+		excludeProviders?: Set<string>,
+		context?: QuotaCheckContext,
+		signal?: AbortSignal,
+	): Promise<string | undefined> {
+		const available = this.getAvailableMembers(pool, authStorage);
+		const eligible = available.filter(
+			(member) => member !== currentProvider && !(excludeProviders?.has(member)),
+		);
+		if (eligible.length === 0) return undefined;
+		if (eligible.length === 1) return eligible[0];
+
+		const accounts: QuotaAccount[] = eligible.map((providerName) => ({
+			providerName,
+			baseProvider: getBaseProvider(providerName) || providerName,
+			displayName: providerName,
+			auth: authStorage.get(providerName) as AuthStorageEntry | undefined,
+		}));
+
+		try {
+			const results = await runQuotaChecks(accounts, signal, context);
+			const usable = results.filter(
+				(r) => r.kind !== "error" && r.kind !== "missing-auth" && r.kind !== "blocked"
+					&& r.windows !== undefined,
+			);
+			// An account is only eligible when every window that applies to the
+			// active model has known, positive remaining allowance.
+			const candidates = usable.filter((result) => {
+				const applicable = result.windows!.filter((w) => w.applies);
+				return applicable.length > 0
+					&& applicable.every((w) => w.remainingPercent !== undefined && w.remainingPercent > 0);
+			});
+			const fiveHourReset = (result: (typeof usable)[number]): number | undefined =>
+				result.windows!.find((w) => w.label === "5h")?.resetAt;
+			const best = [...candidates].sort((left, right) => {
+				const leftReset = fiveHourReset(left);
+				const rightReset = fiveHourReset(right);
+				// Known reset times first, earliest first; unknown resets last.
+				if (leftReset !== undefined && rightReset !== undefined
+					&& leftReset !== rightReset) return leftReset - rightReset;
+				if (leftReset !== undefined) return -1;
+				if (rightReset !== undefined) return 1;
+				return right.score - left.score;
+			})[0];
+			if (best) return best.account.providerName;
+			// No candidate qualified on 5h-reset ordering: fall back to score order.
+			const byScore = results.find(
+				(r) => r.kind !== "error" && r.kind !== "missing-auth",
+			);
+			return byScore?.account.providerName;
+		} catch {
+			// Network failure etc. -- fall back to round-robin.
+			return undefined;
+		}
+	}
+
+	/**
 	 * Reorder failover plan candidates based on the pool's strategy.
 	 * Mutates plan.candidates in place.
 	 */
@@ -3276,6 +3350,36 @@ class PoolManager {
 							"info",
 						);
 						this.recordTrace(`${best} ranked first by quota-first in pool ${pool.name}`);
+					}
+				}
+			} catch {
+				// Quota check failed -- proceed with default order.
+			}
+			return;
+		}
+
+		if (strategy === "5h-reset-first") {
+			try {
+				const best = await this.getEarliest5hResetMember(
+					pool,
+					currentModel.provider,
+					getAuthStorage(ctx),
+					cascade.attemptedProviders,
+					{ modelRegistry: ctx.modelRegistry, modelId: currentModel.id },
+					ctx.signal,
+				);
+				if (best) {
+					const bestIdx = plan.candidates.findIndex(
+						(c) => c.provider === best && c.source === "pool",
+					);
+					if (bestIdx > 0) {
+						const [moved] = plan.candidates.splice(bestIdx, 1);
+						plan.candidates.unshift(moved);
+						ctx.ui.notify(
+							`[pool:${pool.name}] 5h-reset-first: ${best} has the earliest 5h reset with usable allowance`,
+							"info",
+						);
+						this.recordTrace(`${best} ranked first by 5h-reset-first in pool ${pool.name}`);
 					}
 				}
 			} catch {
@@ -4452,12 +4556,14 @@ async function promptForPoolDefinition(
 	const strategyItems = [
 		"round-robin -- Rotate members sequentially (default)",
 		"quota-first -- Prefer the member with the most remaining quota",
+		"5h-reset-first -- Prefer usable members whose 5h window resets soonest",
 		"scheduled -- Use per-member time windows and priority roles",
 		"custom -- Delegate to a JS selector script",
 	];
 	const strategyPick = await ctx.ui.select("Selection strategy", strategyItems);
 	let strategy: PoolStrategy = "round-robin";
 	if (strategyPick?.startsWith("quota-first")) strategy = "quota-first";
+	else if (strategyPick?.startsWith("5h-reset-first")) strategy = "5h-reset-first";
 	else if (strategyPick?.startsWith("scheduled")) strategy = "scheduled";
 	else if (strategyPick?.startsWith("custom")) strategy = "custom";
 
@@ -4684,6 +4790,11 @@ async function changePoolStrategy(
 			value: "quota-first",
 			label: "quota-first",
 			description: "Prefer the member with the most remaining quota",
+		},
+		{
+			value: "5h-reset-first",
+			label: "5h-reset-first",
+			description: "Prefer usable members whose 5h window resets soonest",
 		},
 		{
 			value: "scheduled",

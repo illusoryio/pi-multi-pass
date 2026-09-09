@@ -220,6 +220,20 @@ Uses the same built-in quota checkers as `/subs limits` (currently Anthropic, Co
 }
 ```
 
+#### `5h-reset-first`
+
+Drain near-expiry 5-hour allowance first. Among accounts whose applicable windows all still have allowance (shared 5h/7d plus the active model's scoped limit, e.g. Fable), the account whose 5h window resets soonest is used first. Accounts with an exhausted or unknown applicable window are excluded from 5h-reset ordering; if none qualifies, the quota-first score order is used. Note that switching never discards an account's remaining allowance — you can return to it before its reset.
+
+```json
+{
+  "name": "codex-pool",
+  "baseProvider": "openai-codex",
+  "members": ["openai-codex", "openai-codex-2", "openai-codex-3"],
+  "enabled": true,
+  "strategy": "5h-reset-first"
+}
+```
+
 #### `scheduled`
 
 Assign each member a role and optional time windows:
