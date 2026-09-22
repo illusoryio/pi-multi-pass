@@ -2499,21 +2499,15 @@ function getBaseProvider(providerName: string): string | undefined {
 // Model cloning
 // ==========================================================================
 
-function cloneModels(originalProvider: string, index: number) {
-	const models = getModels(originalProvider as any) as Model<Api>[];
-	return models.map((m) => ({
-		id: m.id,
-		name: `${m.name} (#${index})`,
-		api: m.api,
-		reasoning: m.reasoning,
-		thinkingLevelMap: m.thinkingLevelMap ? { ...m.thinkingLevelMap } : undefined,
-		input: m.input as ("text" | "image")[],
-		cost: { ...m.cost },
-		contextWindow: m.contextWindow,
-		maxTokens: m.maxTokens,
-		headers: m.headers ? { ...m.headers } : undefined,
-		compat: m.compat,
-	}));
+/** Upsert `additions` into `base` by model id (an addition replaces the entry with the same id). */
+function upsertModelsById(base: Model<Api>[], additions: Model<Api>[]): Model<Api>[] {
+	const merged = [...base];
+	for (const model of additions) {
+		const existing = merged.findIndex((entry) => entry.id === model.id);
+		if (existing >= 0) merged[existing] = model;
+		else merged.push(model);
+	}
+	return merged;
 }
 
 /**
@@ -2543,23 +2537,43 @@ function storedOverlayModels(baseProvider: string): Model<Api>[] {
 }
 
 /**
- * Live model list for a subscription provider: the static builtin catalog
- * merged with the base provider's persisted remote-catalog overlay (overlay
- * entries win, mirroring pi's own catalog merge). Returned from
- * `refreshModels` so catalog additions (e.g. gpt-6-astra) and metadata
- * updates reach extra accounts on every model refresh cycle without a
- * pi-multi-pass release.
+ * Read the custom models the user configured for the base provider in
+ * `~/.pi/agent/models.json` (`providers.<id>.models`). Pi merges these into the
+ * base provider itself, but `getBuiltinModels()` returns only the shipped
+ * catalog and models-store.json holds only the remote overlay — so without
+ * this, a model added to models.json (for example one released before the
+ * pi.dev catalog carries it) stays invisible to every extra account.
+ */
+function configuredModels(baseProvider: string): Model<Api>[] {
+	try {
+		const configPath = join(getAgentDir(), "models.json");
+		if (!existsSync(configPath)) return [];
+		const raw = JSON.parse(readFileSync(configPath, "utf8")) as {
+			providers?: Record<string, { models?: unknown }>;
+		};
+		const models = raw.providers?.[baseProvider]?.models;
+		if (!Array.isArray(models)) return [];
+		return models.filter(
+			(m): m is Model<Api> => !!m && typeof m === "object" && typeof (m as Model<Api>).id === "string",
+		);
+	} catch {
+		return [];
+	}
+}
+
+/**
+ * Live model list for a subscription provider: the shipped builtin catalog,
+ * the base provider's persisted remote-catalog overlay, then the user's
+ * configured models — each source wins over the one before it, mirroring pi's
+ * own merge order. Used for the startup baseline and re-read on every refresh
+ * cycle, so catalog additions (e.g. gpt-6-astra), user-configured models, and
+ * metadata updates reach extra accounts without a pi-multi-pass release.
  */
 function liveSubscriptionModels(entry: SubEntry, name: string): Model<Api>[] {
 	const builtin = getModels(entry.provider as any) as Model<Api>[];
 	const overlay = storedOverlayModels(entry.provider);
-	const merged = [...builtin];
-	for (const model of overlay) {
-		const existing = merged.findIndex((m) => m.id === model.id);
-		if (existing >= 0) merged[existing] = model;
-		else merged.push(model);
-	}
-	return merged.map((m) => ({
+	const configured = configuredModels(entry.provider);
+	return upsertModelsById(upsertModelsById(builtin, overlay), configured).map((m) => ({
 		...m,
 		provider: name,
 		name: `${m.name} (#${entry.index})`,
@@ -2579,10 +2593,12 @@ function registerSub(pi: ExtensionAPI, entry: SubEntry): void {
 	const modifyModels = oauth ? template.buildModifyModels?.(name) : undefined;
 	const builtinModels = getModels(entry.provider as any) as Model<Api>[];
 	const baseUrl = builtinModels[0]?.baseUrl || "";
-	const models = cloneModels(entry.provider, entry.index);
 
-	// Static `models` is only the startup baseline; refreshModels swaps in the
-	// live merged catalog (builtin + remote overlay) on every refresh cycle.
+	// Static `models` is the startup baseline, already merged from the builtin
+	// catalog, the persisted overlay, and the user's configured models, so a
+	// newly added model is selectable without waiting for a refresh cycle;
+	// `refreshModels` re-reads the same merge on every refresh cycle.
+	const models = liveSubscriptionModels(entry, name);
 	pi.registerProvider(name, {
 		baseUrl,
 		api: builtinModels[0]?.api,
