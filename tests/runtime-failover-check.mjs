@@ -856,6 +856,14 @@ async function runManualRetryChecks() {
     await f.switchTo("anthropic-3");
     assert.deepEqual(f.actions, ["set:anthropic-2", "set:anthropic-3"], `${boundary} clears retry ownership`);
   }
+  // pi >= 1.2.0 fires before_agent_start for pi-started turns (no prompt):
+  // it must not drop the replay prompt or the failover cascade.
+  const custom = await fixture();
+  await custom.emit("before_agent_start", { messageType: "custom" });
+  await custom.error();
+  await custom.switchTo("anthropic-3");
+  assert.equal(custom.actions.at(-1), "prompt:anthropic-3", "custom turn keeps the replay prompt");
+
   const idle = await fixture();
   await idle.error();
   await idle.settle();

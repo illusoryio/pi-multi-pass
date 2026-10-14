@@ -6478,6 +6478,11 @@ export default function multiSub(pi: ExtensionAPI) {
 
 	// Listen for user input to track last prompt
 	pi.on("before_agent_start", async (event, ctx) => {
+		// pi >= 1.2.0 also fires this for pi-started turns (messageType "custom",
+		// no prompt). Those must not clear the failover cascade, the replay prompt
+		// or the suppressNextStartTurn flag. Missing messageType (pi <= 1.1) = user.
+		const messageType = (event as { messageType?: string }).messageType;
+		if (messageType !== undefined && messageType !== "user") return;
 		lastUserPrompt = event.prompt;
 		poolManager.startTurn(event.prompt, ctx.model);
 	});
