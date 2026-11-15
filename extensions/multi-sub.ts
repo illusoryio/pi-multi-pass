@@ -6448,12 +6448,8 @@ export default function multiSub(pi: ExtensionAPI) {
 		const allowedSummary = formatAllowedProviderSummary(effective);
 		if (allowedSummary) {
 			statusParts.push(`allowed ${allowedSummary}`);
-		} else {
-			const poolCount = effective.pools.filter((p) => p.enabled).length;
-			if (poolCount > 0 && !activeChain) {
-				statusParts.push(`${poolCount} pool(s)`);
-			}
 		}
+		// No "N pool(s)" status: the pool count is noise in the footer (operator 2026-11-15).
 		if (statusParts.length > 0) {
 			ctx.ui.setStatus("multi-pass", statusParts.join(" | "));
 		}
